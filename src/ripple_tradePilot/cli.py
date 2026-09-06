@@ -177,11 +177,12 @@ def backtest(symbol, days, strategy, cash, execution, benchmark, ledger, no_save
     click.echo(f"   交易回合：{stats.num_trades}   胜率：{stats.win_rate:.0%}   总费用：{stats.total_fees:.2f} 元")
     if benchmark:
         from .backtest.report import compare_with_benchmark
-        index_df = loader.get_index_bars('000300.SH', start_date=start_date, end_date=end_date)
-        if len(index_df):
-            comparison = compare_with_benchmark(
-                result.equity_curve, [float(v) for v in index_df['close']]
-            )
+        # C1：基准改走 DB 优先的 load_index_bars（离线可测，降级链 tushare→akshare）
+        from .data.market_service import load_index_bars
+        index_rows = load_index_bars('000300.SH', start_date=start_date, end_date=end_date)
+        closes = [float(row['close']) for row in index_rows if row.get('close') is not None]
+        if closes:
+            comparison = compare_with_benchmark(result.equity_curve, closes)
             click.echo(
                 f"   沪深300基准：{comparison.benchmark_return:+.2%}"
                 f"   超额收益：{comparison.excess_return:+.2%}"

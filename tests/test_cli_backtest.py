@@ -28,7 +28,12 @@ from ripple_tradePilot.storage.user_store import (
 
 
 class FakeLoader:
-    """替换 TushareDataLoader：load_bars 返回合成日线，get_index_bars 返回空。"""
+    """替换 TushareDataLoader：load_bars 返回合成日线。
+
+    C1：CLI ``--benchmark`` 改走 ``market_service.load_index_bars``（DB 优先），
+    不再经 loader.get_index_bars，故此处不再 mock 指数（基准测试单独 patch
+    ``market_service.load_index_bars``）。
+    """
 
     bars = synth.daily_bars(200, seed=21)
 
@@ -37,11 +42,6 @@ class FakeLoader:
 
     def load_bars(self, symbol, start_date=None, end_date=None):
         return list(type(self).bars)
-
-    def get_index_bars(self, *args, **kwargs):
-        import pandas as pd
-
-        return pd.DataFrame()
 
 
 class _CliDbTestCase(unittest.TestCase):
@@ -115,6 +115,39 @@ class CliBacktestSaveTest(_CliDbTestCase):
         self.assertEqual(result.exit_code, 0, result.output)
         self.assertNotIn("已落库", result.output)
         self.assertEqual(list_backtest_runs(), [])
+
+    def test_backtest_benchmark_uses_load_index_bars(self):
+        # C1：--benchmark 走 DB 优先的 market_service.load_index_bars（离线 mock），
+        # 取到指数则打印基准对比行；零网络。
+        index_rows = [
+            {"trade_date": f"202601{i:02d}", "close": 3000.0 + i * 10}
+            for i in range(1, 9)
+        ]
+        with patch(
+            "ripple_tradePilot.data.market_service.load_index_bars",
+            return_value=index_rows,
+        ) as mock_load:
+            result = self.runner.invoke(
+                cli,
+                ["backtest", "600000.SH", "-d", "200", "-s", "rsi", "--benchmark"],
+            )
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("沪深300基准", result.output)
+        self.assertIn("超额收益", result.output)
+        # 确认拉的是沪深300基准
+        self.assertEqual(mock_load.call_args[0][0], "000300.SH")
+
+    def test_backtest_benchmark_degrades_on_empty_index(self):
+        # load_index_bars 返回空（离线/无数据）→ 跳过基准对比，回测主体不报错
+        with patch(
+            "ripple_tradePilot.data.market_service.load_index_bars", return_value=[]
+        ):
+            result = self.runner.invoke(
+                cli,
+                ["backtest", "600000.SH", "-d", "200", "-s", "rsi", "--benchmark"],
+            )
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("未取到沪深300基准数据", result.output)
 
     def test_backtests_list_shows_records(self):
         self.runner.invoke(cli, ["backtest", "600000.SH", "-d", "200", "-s", "rsi"])

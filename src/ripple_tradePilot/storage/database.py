@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any, Iterable, List, Mapping
 
 
-DATABASE_SCHEMA_VERSION = 13
+DATABASE_SCHEMA_VERSION = 14
 
 
 BACKTEST_COLUMNS = {
@@ -176,6 +176,41 @@ SIGNAL_LEDGER_COLUMNS = {
 KV_STORE_COLUMNS = {
     "key": "key TEXT",
     "value": "value TEXT",
+    "updated_at": "updated_at TIMESTAMP",
+}
+
+# v14（C1）：指数日线落库。每个 (index_code, trade_date) 一行，供基准对比与市场
+# 特征复用——此前指数历史从不落库，benchmark 每次回测都实时拉 Tushare（离线即降级）。
+# index_code 用 tushare 风格代码（000300.SH / 000001.SH / 399001.SZ / 399006.SZ）。
+INDEX_DAILY_COLUMNS = {
+    "id": "id INTEGER",
+    "index_code": "index_code TEXT",
+    "trade_date": "trade_date TEXT",
+    "open": "open REAL",
+    "high": "high REAL",
+    "low": "low REAL",
+    "close": "close REAL",
+    "pct_chg": "pct_chg REAL",
+    "amount": "amount REAL",
+    "volume": "volume REAL DEFAULT 0",
+    "source": "source TEXT DEFAULT ''",
+    "updated_at": "updated_at TIMESTAMP",
+}
+
+# v14（C2）：市场宽度按交易日积累。无免费历史宽度 API，故走"增量积累制"——
+# monitor 收盘例程 / `data refresh-market` 用当日 stock_quotes 终态快照聚合写入。
+# 涨跌停家数用 A7 price_limit_for_symbol 分板块判定（替代旧的 ±9.8% 一刀切）。
+# trade_date 为主键：每个交易日一行，重复刷新 upsert 覆盖。
+MARKET_DAILY_COLUMNS = {
+    "trade_date": "trade_date TEXT",
+    "advancers": "advancers INTEGER DEFAULT 0",
+    "decliners": "decliners INTEGER DEFAULT 0",
+    "unchanged": "unchanged INTEGER DEFAULT 0",
+    "limit_up": "limit_up INTEGER DEFAULT 0",
+    "limit_down": "limit_down INTEGER DEFAULT 0",
+    "total_amount": "total_amount REAL DEFAULT 0",
+    "up_ratio": "up_ratio REAL",
+    "source": "source TEXT DEFAULT ''",
     "updated_at": "updated_at TIMESTAMP",
 }
 
@@ -512,6 +547,51 @@ def init_database(path: Path | None = None) -> Path:
             """
         )
         _ensure_columns(connection, "kv_store", KV_STORE_COLUMNS)
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS index_daily (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                index_code TEXT NOT NULL,
+                trade_date TEXT NOT NULL,
+                open REAL,
+                high REAL,
+                low REAL,
+                close REAL,
+                pct_chg REAL,
+                amount REAL,
+                volume REAL NOT NULL DEFAULT 0,
+                source TEXT NOT NULL DEFAULT '',
+                updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(index_code, trade_date)
+            )
+            """
+        )
+        _ensure_columns(connection, "index_daily", INDEX_DAILY_COLUMNS)
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_index_daily_code_date "
+            "ON index_daily(index_code, trade_date)"
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS market_daily (
+                trade_date TEXT PRIMARY KEY,
+                advancers INTEGER NOT NULL DEFAULT 0,
+                decliners INTEGER NOT NULL DEFAULT 0,
+                unchanged INTEGER NOT NULL DEFAULT 0,
+                limit_up INTEGER NOT NULL DEFAULT 0,
+                limit_down INTEGER NOT NULL DEFAULT 0,
+                total_amount REAL NOT NULL DEFAULT 0,
+                up_ratio REAL,
+                source TEXT NOT NULL DEFAULT '',
+                updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        _ensure_columns(connection, "market_daily", MARKET_DAILY_COLUMNS)
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_market_daily_date "
+            "ON market_daily(trade_date DESC)"
+        )
         integrity = connection.execute("PRAGMA integrity_check").fetchone()
         if not integrity or integrity[0] != "ok":
             raise RuntimeError(f"SQLite integrity check failed for {target}: {integrity}")
@@ -616,6 +696,152 @@ def upsert_daily_bars(
             ],
         )
     return len(records)
+
+
+def upsert_index_daily(
+    index_code: str,
+    rows: Iterable[Mapping[str, Any]],
+    source: str,
+    path: Path | None = None,
+) -> int:
+    """写入/更新某指数日线（C1）。
+
+    ``rows`` 的 ``trade_date`` 须为 ``YYYYMMDD``（market_service 落库前统一归一化），
+    成交量列接受 ``vol`` 或 ``volume``。按 ``(index_code, trade_date)`` upsert 幂等。
+    """
+    records = list(rows)
+    if not records:
+        return 0
+    target = init_database(path)
+    with sqlite3.connect(target, timeout=30) as connection:
+        connection.executemany(
+            """
+            INSERT INTO index_daily (
+                index_code, trade_date, open, high, low, close,
+                pct_chg, amount, volume, source, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(index_code, trade_date) DO UPDATE SET
+                open = excluded.open,
+                high = excluded.high,
+                low = excluded.low,
+                close = excluded.close,
+                pct_chg = excluded.pct_chg,
+                amount = excluded.amount,
+                volume = excluded.volume,
+                source = excluded.source,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            [
+                (
+                    index_code,
+                    row.get("trade_date"),
+                    row.get("open"),
+                    row.get("high"),
+                    row.get("low"),
+                    row.get("close"),
+                    row.get("pct_chg"),
+                    row.get("amount"),
+                    row.get("vol", row.get("volume")) or 0,
+                    source,
+                )
+                for row in records
+            ],
+        )
+    return len(records)
+
+
+def load_index_bars(
+    index_code: str, path: Path | None = None
+) -> List[Mapping[str, Any]]:
+    """纯 DB 读取某指数日线（升序）。键与 ``load_daily_bars`` 对齐（成交量为 ``vol``）。
+
+    离线只读，不触发任何网络。DB 优先 + 有界补拉的封装见
+    ``data.market_service.load_index_bars``。
+    """
+    target = init_database(path)
+    with sqlite3.connect(target, timeout=30) as connection:
+        connection.row_factory = sqlite3.Row
+        rows = connection.execute(
+            """
+            SELECT trade_date, open, high, low, close, pct_chg,
+                   amount, volume AS vol, source
+            FROM index_daily
+            WHERE index_code = ?
+            ORDER BY trade_date
+            """,
+            (index_code,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def record_market_daily(
+    trade_date: str,
+    breadth: Mapping[str, Any],
+    source: str = "snapshot",
+    path: Path | None = None,
+) -> None:
+    """写入/更新某交易日的市场宽度（C2）。
+
+    ``breadth`` 取 ``aggregate_breadth`` 的规范输出（advancers/decliners/unchanged/
+    limit_up/limit_down/total_amount/up_ratio）。按 ``trade_date`` 主键 upsert 幂等，
+    同日重复刷新（盘中 provisional → 收盘 final）覆盖为最新终态。
+    """
+    target = init_database(path)
+    with sqlite3.connect(target, timeout=30) as connection:
+        connection.execute(
+            """
+            INSERT INTO market_daily (
+                trade_date, advancers, decliners, unchanged,
+                limit_up, limit_down, total_amount, up_ratio, source, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(trade_date) DO UPDATE SET
+                advancers = excluded.advancers,
+                decliners = excluded.decliners,
+                unchanged = excluded.unchanged,
+                limit_up = excluded.limit_up,
+                limit_down = excluded.limit_down,
+                total_amount = excluded.total_amount,
+                up_ratio = excluded.up_ratio,
+                source = excluded.source,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (
+                trade_date,
+                int(breadth.get("advancers", 0) or 0),
+                int(breadth.get("decliners", 0) or 0),
+                int(breadth.get("unchanged", 0) or 0),
+                int(breadth.get("limit_up", 0) or 0),
+                int(breadth.get("limit_down", 0) or 0),
+                float(breadth.get("total_amount", 0.0) or 0.0),
+                breadth.get("up_ratio"),
+                source,
+            ),
+        )
+
+
+def load_market_daily(
+    path: Path | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
+) -> List[Mapping[str, Any]]:
+    """读取市场宽度历史（升序）。``start_date``/``end_date`` 为 ``YYYYMMDD`` 闭区间过滤。"""
+    target = init_database(path)
+    query = "SELECT * FROM market_daily"
+    clauses: List[str] = []
+    params: List[Any] = []
+    if start_date:
+        clauses.append("trade_date >= ?")
+        params.append(start_date)
+    if end_date:
+        clauses.append("trade_date <= ?")
+        params.append(end_date)
+    if clauses:
+        query += " WHERE " + " AND ".join(clauses)
+    query += " ORDER BY trade_date"
+    with sqlite3.connect(target, timeout=30) as connection:
+        connection.row_factory = sqlite3.Row
+        rows = connection.execute(query, params).fetchall()
+    return [dict(row) for row in rows]
 
 
 def upsert_stock_catalog(

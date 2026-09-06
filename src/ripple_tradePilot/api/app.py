@@ -19,7 +19,7 @@ from ripple_tradePilot.backtest.report import compute_metrics, compute_trade_sta
 from ripple_tradePilot.backtest.rules import MarketRules, price_limit_for_symbol
 from ripple_tradePilot.backtest.serialize import serialize_backtest_result
 from ripple_tradePilot.models.types import Bar
-from ripple_tradePilot.config_loader import get_tushare_token, get_vote_threshold, load_config
+from ripple_tradePilot.config_loader import get_vote_threshold, load_config
 from ripple_tradePilot.signals.backtest_profile import (
     BACKTEST_STRATEGIES,
     PARAM_WHITELIST,
@@ -28,12 +28,15 @@ from ripple_tradePilot.signals.backtest_profile import (
     params_schema,
     resolve_backtest_strategy,
 )
+from ripple_tradePilot.data.market_service import (
+    aggregate_breadth,
+    load_index_bars,
+)
 from ripple_tradePilot.data.stock_service import (
     InvalidStockSymbolError,
     StockDataService,
     StockDataUnavailableError,
 )
-from ripple_tradePilot.data.tushare_loader import TushareDataLoader
 from ripple_tradePilot.storage.database import (
     init_database,
     list_stock_catalog,
@@ -605,8 +608,7 @@ def refresh_stock_quotes(user: Dict = Depends(required_user)):
 
 # 市场总览：本地快照超过该时长视为过期，先尝试刷新一次
 MARKET_OVERVIEW_MAX_AGE = timedelta(minutes=5)
-# 涨跌停近似阈值（主板 ±10%；创业板/科创板 ±20%，此处统一近似，见 breadth 注释）
-MARKET_LIMIT_PCT = 9.8
+# 涨跌停分类口径已移至 market_service.aggregate_breadth（C2，分板块判定）
 
 
 def _in_trading_hours(moment: Optional[datetime] = None) -> bool:
@@ -665,27 +667,20 @@ def _market_overview_data() -> Dict[str, Any]:
         raise StockDataUnavailableError("暂无全市场行情快照，请稍后重试")
     stale = latest is None or datetime.now() - latest > MARKET_OVERVIEW_MAX_AGE
 
-    breadth = {"total": len(rows), "up": 0, "flat": 0, "down": 0, "limit_up": 0, "limit_down": 0}
-    turnover = 0.0
-    for row in rows:
-        change_pct = row.get("change_pct")
-        if change_pct is None:
-            breadth["flat"] += 1
-        elif change_pct > 0:
-            breadth["up"] += 1
-        elif change_pct < 0:
-            breadth["down"] += 1
-        else:
-            breadth["flat"] += 1
-        if change_pct is not None:
-            # 近似口径：主板涨跌停为 ±10%，创业板/科创板为 ±20%，此处统一按 ±9.8% 估算
-            if change_pct >= MARKET_LIMIT_PCT:
-                breadth["limit_up"] += 1
-            elif change_pct <= -MARKET_LIMIT_PCT:
-                breadth["limit_down"] += 1
-        amount = row.get("amount")
-        if amount is not None:
-            turnover += float(amount)
+    # C2：宽度聚合抽到 market_service.aggregate_breadth（共享纯函数，monitor 收盘例程
+    # 与 data refresh-market 复用同一口径）。涨跌停分类改用 A7 price_limit_for_symbol
+    # 分板块判定（主板 10%/创业板·科创板 20%/北交所 30%），替代旧的 ±9.8% 一刀切——
+    # 顺带修复"创业板 +9.85% 被误判涨停"的口径错误。响应键沿用旧的 up/flat/down 命名。
+    snapshot = aggregate_breadth(rows)
+    breadth = {
+        "total": snapshot["total"],
+        "up": snapshot["advancers"],
+        "flat": snapshot["unchanged"],
+        "down": snapshot["decliners"],
+        "limit_up": snapshot["limit_up"],
+        "limit_down": snapshot["limit_down"],
+    }
+    turnover = snapshot["total_amount"]
 
     # 市场宽度优先用妙想（结构不保证，解析失败回退本地快照统计）
     breadth_from_mx = False
@@ -907,34 +902,29 @@ def _benchmark_unavailable() -> Dict[str, Any]:
 def _benchmark_payload(bars: list) -> Dict[str, Any]:
     """取沪深300基准并归一化（第一个点 value=1.0），日期区间与回测 bars 对齐。
 
-    通过 Tushare 取指数日线；无 token / 无数据 / 任何异常都返回
-    available=false，绝不抛错，保证离线也能优雅降级。
+    C1：改走 ``market_service.load_index_bars``（DB 优先 + 有界补拉，降级链
+    tushare→akshare）；无数据 / 任何异常都返回 available=false，绝不抛错，
+    保证离线也能优雅降级。归一化逻辑与迁移前一致，前端曲线不变。
     """
     if not bars:
         return _benchmark_unavailable()
+    start_date = bars[0].timestamp.strftime("%Y%m%d")
+    end_date = bars[-1].timestamp.strftime("%Y%m%d")
     try:
-        config = load_config()
-        token = get_tushare_token(config)
-        loader = TushareDataLoader(
-            token,
-            rate_limit_delay=float(
-                config.get("tushare", {}).get("rate_limit_delay", 1.5)
-            ),
+        rows = load_index_bars(
+            _BENCHMARK_CODE, start_date=start_date, end_date=end_date
         )
-        start_date = bars[0].timestamp.strftime("%Y%m%d")
-        end_date = bars[-1].timestamp.strftime("%Y%m%d")
-        index_df = loader.get_index_bars(_BENCHMARK_CODE, start_date, end_date)
     except Exception:
         logger.warning("沪深300基准获取失败，跳过基准对比", exc_info=True)
         return _benchmark_unavailable()
 
-    if index_df is None or len(index_df) == 0 or "close" not in index_df.columns:
+    if not rows:
         return _benchmark_unavailable()
 
     # 过滤无效收盘价，按首个有效点归一化；日期转为 YYYY-MM-DD
     curve = []
     base = None
-    for _, row in index_df.iterrows():
+    for row in rows:
         trade_date = str(row.get("trade_date") or "")
         if len(trade_date) != 8:
             continue

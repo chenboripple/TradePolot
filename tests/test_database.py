@@ -13,7 +13,11 @@ from ripple_tradePilot.storage.database import (
     DATABASE_SCHEMA_VERSION,
     list_stock_catalog,
     load_daily_bars,
+    load_index_bars,
+    load_market_daily,
+    record_market_daily,
     upsert_daily_bars,
+    upsert_index_daily,
     upsert_stock_catalog,
     upsert_stock_quotes,
 )
@@ -578,7 +582,6 @@ class SchemaV13MigrationTest(unittest.TestCase):
             with sqlite3.connect(target) as connection:
                 version = connection.execute("PRAGMA user_version").fetchone()[0]
             self.assertEqual(version, DATABASE_SCHEMA_VERSION)
-            self.assertEqual(version, 13)
 
     def test_legacy_v12_db_upgrades_to_v13(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -599,7 +602,7 @@ class SchemaV13MigrationTest(unittest.TestCase):
             self.assertTrue(self.LEDGER_COLS.issubset(self._columns(target, "signal_ledger")))
             with sqlite3.connect(target) as connection:
                 version = connection.execute("PRAGMA user_version").fetchone()[0]
-            self.assertEqual(version, 13)
+            self.assertEqual(version, DATABASE_SCHEMA_VERSION)
 
     def test_init_database_idempotent_for_v13(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -637,6 +640,147 @@ class SchemaV13MigrationTest(unittest.TestCase):
                 ),
                 f"未见 (symbol, trade_date, source, provisional) 唯一约束：{unique_column_sets}",
             )
+
+
+class SchemaV14MigrationTest(unittest.TestCase):
+    """v14（C1 指数日线 + C2 市场宽度）迁移、幂等与读写往返。"""
+
+    INDEX_COLS = {
+        "id", "index_code", "trade_date", "open", "high", "low", "close",
+        "pct_chg", "amount", "volume", "source", "updated_at",
+    }
+    MARKET_COLS = {
+        "trade_date", "advancers", "decliners", "unchanged", "limit_up",
+        "limit_down", "total_amount", "up_ratio", "source", "updated_at",
+    }
+
+    def _tables(self, target):
+        with sqlite3.connect(target) as connection:
+            return {
+                row[0]
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )
+            }
+
+    def _columns(self, target, table):
+        with sqlite3.connect(target) as connection:
+            return {row[1] for row in connection.execute(f"PRAGMA table_info({table})")}
+
+    def test_fresh_db_has_index_and_market_tables(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target = Path(temp_dir) / "fresh14.db"
+            init_database(target)
+            tables = self._tables(target)
+            self.assertIn("index_daily", tables)
+            self.assertIn("market_daily", tables)
+            self.assertTrue(self.INDEX_COLS.issubset(self._columns(target, "index_daily")))
+            self.assertTrue(self.MARKET_COLS.issubset(self._columns(target, "market_daily")))
+            with sqlite3.connect(target) as connection:
+                version = connection.execute("PRAGMA user_version").fetchone()[0]
+            self.assertEqual(version, DATABASE_SCHEMA_VERSION)
+            self.assertEqual(version, 14)
+
+    def test_legacy_v13_db_upgrades_to_v14(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target = Path(temp_dir) / "legacy-v13.db"
+            init_database(target)
+            with sqlite3.connect(target) as connection:
+                connection.execute("DROP TABLE index_daily")
+                connection.execute("DROP TABLE market_daily")
+                connection.execute("PRAGMA user_version=13")
+            self.assertNotIn("index_daily", self._tables(target))
+
+            init_database(target)  # 重新初始化应补建 v14 表
+
+            tables = self._tables(target)
+            self.assertIn("index_daily", tables)
+            self.assertIn("market_daily", tables)
+            with sqlite3.connect(target) as connection:
+                version = connection.execute("PRAGMA user_version").fetchone()[0]
+            self.assertEqual(version, 14)
+
+    def test_init_database_idempotent_for_v14(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target = Path(temp_dir) / "idem14.db"
+            init_database(target)
+            init_database(target)  # 第二次不得抛错或重复建表
+            self.assertIn("index_daily", self._tables(target))
+            self.assertIn("market_daily", self._tables(target))
+
+    def test_index_daily_unique_constraint_present(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target = Path(temp_dir) / "uniq14.db"
+            init_database(target)
+            with sqlite3.connect(target) as connection:
+                index_list = connection.execute("PRAGMA index_list(index_daily)").fetchall()
+                unique_sets = []
+                for entry in index_list:
+                    name, is_unique, origin = entry[1], entry[2], entry[3]
+                    if not is_unique:
+                        continue
+                    cols = {
+                        row[2]
+                        for row in connection.execute(f"PRAGMA index_info({name})")
+                    }
+                    unique_sets.append((origin, cols))
+            self.assertTrue(
+                any(
+                    origin == "u"
+                    and {"index_code", "trade_date"}.issubset(cols)
+                    for origin, cols in unique_sets
+                ),
+                f"未见 (index_code, trade_date) 唯一约束：{unique_sets}",
+            )
+
+    def test_index_daily_upsert_and_load_round_trip(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target = Path(temp_dir) / "index.db"
+            rows = [
+                {"trade_date": "20260102", "open": 3000, "high": 3050, "low": 2990,
+                 "close": 3040, "pct_chg": 1.33, "amount": 1.2e11, "vol": 9.5e9},
+                {"trade_date": "20260103", "open": 3040, "high": 3060, "low": 3020,
+                 "close": 3055, "pct_chg": 0.49, "amount": 1.1e11, "vol": 9.1e9},
+            ]
+            self.assertEqual(upsert_index_daily("000300.SH", rows, "tushare", target), 2)
+            # 幂等 + 覆盖：重写 20260103 的 close
+            upsert_index_daily(
+                "000300.SH", [{**rows[1], "close": 3099, "vol": 9.9e9}], "akshare", target
+            )
+            loaded = load_index_bars("000300.SH", target)
+            self.assertEqual(len(loaded), 2)
+            self.assertEqual(loaded[0]["trade_date"], "20260102")  # 升序
+            self.assertEqual(loaded[1]["close"], 3099)
+            self.assertEqual(loaded[1]["vol"], 9.9e9)
+            self.assertEqual(loaded[1]["source"], "akshare")
+            # 不同指数互不干扰
+            self.assertEqual(load_index_bars("000001.SH", target), [])
+
+    def test_market_daily_record_and_load_round_trip(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target = Path(temp_dir) / "market.db"
+            breadth = {
+                "advancers": 2800, "decliners": 1900, "unchanged": 300,
+                "limit_up": 45, "limit_down": 12,
+                "total_amount": 9.8e11, "up_ratio": 0.56,
+            }
+            record_market_daily("20260102", breadth, "snapshot", target)
+            # 同日收盘终态覆盖盘中 provisional
+            record_market_daily(
+                "20260102", {**breadth, "advancers": 2950, "up_ratio": 0.59}, "mx", target
+            )
+            record_market_daily("20260103", breadth, "snapshot", target)
+
+            rows = load_market_daily(target)
+            self.assertEqual(len(rows), 2)
+            self.assertEqual(rows[0]["trade_date"], "20260102")  # 升序
+            self.assertEqual(rows[0]["advancers"], 2950)
+            self.assertEqual(rows[0]["up_ratio"], 0.59)
+            self.assertEqual(rows[0]["source"], "mx")
+
+            # 日期闭区间过滤
+            only_first = load_market_daily(target, start_date="20260102", end_date="20260102")
+            self.assertEqual([r["trade_date"] for r in only_first], ["20260102"])
 
 
 if __name__ == "__main__":

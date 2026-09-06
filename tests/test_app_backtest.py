@@ -10,7 +10,6 @@ from datetime import date, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
-import pandas as pd
 from fastapi.testclient import TestClient
 
 from ripple_tradePilot.api.app import app
@@ -234,16 +233,16 @@ class WebBacktestApiTest(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 422)
 
-    def test_backtest_benchmark_degrades_without_token(self):
-        """benchmark=true 但无 tushare token：200 + available=false，不联网。"""
+    def test_backtest_benchmark_degrades_without_index_data(self):
+        """benchmark=true 但 load_index_bars 无数据（离线/无 token）：200 + available=false。
+
+        C1：基准 mock 缝从 TushareDataLoader 迁到 market_service.load_index_bars
+        （app.py 不再直接构造 loader）；返回空即优雅降级，绝不抛错、不联网。
+        """
         self.register()
         upsert_daily_bars(SYMBOL, _seed_rows(), "test", database_path())
 
-        with patch.object(
-            api_module,
-            "TushareDataLoader",
-            side_effect=AssertionError("无 token 时不应构造 TushareDataLoader"),
-        ):
+        with patch.object(api_module, "load_index_bars", return_value=[]):
             response = self.client.post(
                 "/api/backtest",
                 json={
@@ -272,30 +271,21 @@ class WebBacktestApiTest(unittest.TestCase):
         )
 
     def test_backtest_benchmark_curve_normalized(self):
-        """benchmark=true 且指数数据可用：归一化曲线首点 1.0，全程离线（mock）。"""
+        """benchmark=true 且指数数据可用：归一化曲线首点 1.0，全程离线（mock load_index_bars）。"""
         self.register()
         upsert_daily_bars(SYMBOL, _seed_rows(), "test", database_path())
 
-        index_df = pd.DataFrame(
+        # C1：load_index_bars 返回 DB 风格行（trade_date=YYYYMMDD + close）；
+        # _benchmark_payload 的归一化逻辑迁移前后一致 → 断言值不变。
+        index_rows = [
             {
-                "trade_date": [
-                    (date(2026, 1, 1) + timedelta(days=i)).strftime("%Y%m%d")
-                    for i in range(100)
-                ],
-                "close": [3000.0 + i * 5 for i in range(100)],
+                "trade_date": (date(2026, 1, 1) + timedelta(days=i)).strftime("%Y%m%d"),
+                "close": 3000.0 + i * 5,
             }
-        )
+            for i in range(100)
+        ]
 
-        class FakeLoader:
-            def __init__(self, token, rate_limit_delay=1.5):
-                self.token = token
-
-            def get_index_bars(self, index_code, start_date, end_date):
-                return index_df
-
-        with patch.object(api_module, "load_config", return_value={}), patch.object(
-            api_module, "get_tushare_token", return_value="fake-token"
-        ), patch.object(api_module, "TushareDataLoader", FakeLoader):
+        with patch.object(api_module, "load_index_bars", return_value=index_rows):
             response = self.client.post(
                 "/api/backtest",
                 json={
