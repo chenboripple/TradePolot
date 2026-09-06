@@ -850,6 +850,87 @@ def signals_list(status, source, symbol, limit):
         )
 
 
+@cli.group()
+def ml():
+    """ML 信号质量模型（数据集构建 → 训练 → 评估 → 晋升；D 阶段）"""
+
+
+@ml.command('build-dataset')
+@click.option('--pool', type=click.Choice(['config', 'watchlist', 'catalog']), default='config',
+              help='股票池来源：config.yaml symbols / Web 观察池 / 库内有日线的全部标的')
+@click.option('--symbols', default=None, help='显式标的（逗号分隔，覆盖 --pool）')
+@click.option('--start', default=None, help='决策日起点 YYYYMMDD（含）')
+@click.option('--end', default=None, help='决策日终点 YYYYMMDD（含）')
+@click.option('--horizon', type=int, default=5, help='主前瞻标签天数（T+1 开盘进、T+1+h 开盘出）')
+@click.option('--aux-horizon', type=int, default=10, help='辅助前瞻标签天数')
+@click.option('--groups', default='signal,price_volume,market,industry',
+              help='启用特征组（逗号分隔；signal/price_volume/market/industry）')
+@click.option('--index-code', default='000300.SH', help='market 组基准指数')
+@click.option('--out-dir', default=None, help='csv.gz / manifest 输出目录（默认 data/ml）')
+@click.option('--no-register', is_flag=True, help='只产文件，不写 ml_datasets 表')
+def ml_build_dataset(pool, symbols, start, end, horizon, aux_horizon, groups,
+                     index_code, out_dir, no_register):
+    """构建 ML 数据集（D2）：特征（D1）+ 前瞻标签（B1）→ csv.gz + manifest 落库。
+
+    逐标的过 A9 复权巡检（混接嫌疑拒入并记录）；行业成分为最新单快照，manifest 标
+    ``industry_point_in_time=False`` 前视警告。同库同参数重跑 → 同 dataset_id（幂等）。
+    """
+    from pathlib import Path
+
+    from .ml.dataset import build_dataset
+    from .ml.features import FEATURE_GROUPS
+
+    if symbols:
+        symbol_list = [s.strip() for s in symbols.split(',') if s.strip()]
+    elif pool == 'watchlist':
+        from .storage.user_store import list_all_watched_symbols
+        symbol_list = [str(item['symbol']) for item in list_all_watched_symbols()
+                       if item.get('symbol')]
+    elif pool == 'catalog':
+        from .storage.database import list_daily_bar_symbols
+        symbol_list = list_daily_bar_symbols()
+    else:
+        cfg = load_config()
+        symbol_list = [str(s.get('code')) for s in cfg.get('symbols', []) if s.get('code')]
+
+    group_list = tuple(g.strip() for g in groups.split(',') if g.strip())
+    bad_groups = [g for g in group_list if g not in FEATURE_GROUPS]
+    if bad_groups:
+        click.echo(f"未知特征组：{bad_groups}；合法值 {list(FEATURE_GROUPS)}", err=True)
+        sys.exit(2)
+    if not symbol_list:
+        click.echo(f"⚠️ 股票池（--pool {pool}）无标的，无法构建数据集", err=True)
+        sys.exit(2)
+
+    click.echo(
+        f"\n📦 构建 ML 数据集（D2）：{len(symbol_list)} 标的 · 组 {','.join(group_list)} · "
+        f"horizon {horizon}(+{aux_horizon})"
+    )
+    manifest = build_dataset(
+        symbol_list,
+        start=start,
+        end=end,
+        horizon=horizon,
+        aux_horizon=aux_horizon,
+        groups=group_list,
+        index_code=index_code,
+        out_dir=Path(out_dir) if out_dir else None,
+        register=not no_register,
+    )
+    click.echo(f"   dataset_id：{manifest.dataset_id}")
+    click.echo(
+        f"   行数 {manifest.n_rows}（正例 {manifest.n_positive}，{manifest.positive_rate:.1%}）· "
+        f"日期 {manifest.start_date}~{manifest.end_date} · 新鲜度 {manifest.max_trade_date}"
+    )
+    click.echo(f"   特征列 {len(manifest.feature_columns)} · 输出 {manifest.csv_path}")
+    if manifest.rejected:
+        click.echo(f"   ⚠️ 拒入 {len(manifest.rejected)} 只：")
+        for item in manifest.rejected:
+            click.echo(f"     ✗ {item['symbol']}：{item['reason']}")
+    for warning in manifest.warnings:
+        click.echo(f"   ⚠️ {warning}")
+
+
 @cli.command()
 def version():
     """显示版本"""

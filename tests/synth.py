@@ -286,16 +286,89 @@ def ml_frame(
     return X, y, ret, p_true
 
 
+def market_daily_rows(
+    count: int, start: datetime = DEFAULT_START
+) -> List[Dict[str, object]]:
+    """确定性市场宽度行（market_daily 表格式）：随日变化的涨跌家数/涨停/成交额。
+
+    成交额刻意非常数，保证 D 阶段 ``total_amount_z`` 等 z 分数特征非退化（std>0）。
+    """
+    days = trading_days(count, start)
+    rows: List[Dict[str, object]] = []
+    for i, day in enumerate(days):
+        advancers = 1500 + (i * 37) % 1500
+        decliners = 1200 + (i * 53) % 1200
+        unchanged = 100 + (i * 11) % 200
+        total = advancers + decliners + unchanged
+        rows.append(
+            {
+                "trade_date": day.strftime("%Y%m%d"),
+                "advancers": advancers,
+                "decliners": decliners,
+                "unchanged": unchanged,
+                "limit_up": 20 + (i * 7) % 60,
+                "limit_down": 5 + (i * 3) % 25,
+                "total_amount": 8e11 + (i * 1.7e9) % 4e11,
+                "up_ratio": round(advancers / total, 4) if total else None,
+            }
+        )
+    return rows
+
+
 def seed_market_db(
     db_path: Path,
     symbols: Sequence[str] = ("002022.SZ", "600309.SH", "601816.SH"),
     days: int = 300,
+    *,
+    with_market: bool = True,
+    board_code: str = "BK0475",
+    board_name: str = "生物制品",
 ) -> Path:
-    """一体化临时库：建 schema 并灌入多标的确定性日线（C 阶段扩展指数/板块表）。"""
-    from ripple_tradePilot.storage.database import init_database, upsert_daily_bars
+    """一体化临时库：多标的确定性日线 + 指数 + 市场宽度 + 行业板块（D 阶段全特征组）。
+
+    所有时序共用 ``trading_days(days, DEFAULT_START)`` 日历，trade_date 逐日对齐，
+    保证 D1 特征管道按 trade_date 的 market/industry 左连接命中。``with_market=False``
+    只灌个股日线（纯 price_volume/signal 测试用）。
+    """
+    from ripple_tradePilot.storage.database import (
+        init_database,
+        record_market_daily,
+        upsert_daily_bars,
+        upsert_index_daily,
+        upsert_industry_board_bars,
+        upsert_industry_boards,
+        upsert_industry_membership,
+    )
 
     init_database(db_path)
     for offset, symbol in enumerate(symbols):
         bars = daily_bars(days, seed=100 + offset, drift=0.0003 * (offset - 1))
-        upsert_daily_bars(symbol, daily_rows(bars), "synth", db_path)
+        upsert_daily_bars(
+            symbol,
+            daily_rows(bars),
+            "synth",
+            db_path,
+            data_version=f"synth|20260417|seed{100 + offset}",
+        )
+
+    if not with_market:
+        return db_path
+
+    # 指数（沪深300）+ 市场宽度
+    upsert_index_daily("000300.SH", index_rows(days), "synth", db_path)
+    for row in market_daily_rows(days):
+        record_market_daily(str(row["trade_date"]), row, "synth", db_path)
+
+    # 行业板块：单板块覆盖全部标的（成分快照 as_of 取末日，D 阶段标 point_in_time=False）
+    upsert_industry_boards(
+        [{"board_code": board_code, "board_name": board_name}], "synth", db_path
+    )
+    upsert_industry_board_bars(
+        board_code, board_rows(days, board_code=board_code, board_name=board_name),
+        "synth", db_path,
+    )
+    last_day = trading_days(days)[-1].strftime("%Y%m%d")
+    upsert_industry_membership(
+        board_code, list(symbols), last_day, "synth", db_path
+    )
     return db_path

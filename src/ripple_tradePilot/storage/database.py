@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 from pathlib import Path
-from typing import Any, Iterable, List, Mapping
+from typing import Any, Dict, Iterable, List, Mapping, Optional
 
 
-DATABASE_SCHEMA_VERSION = 14
+DATABASE_SCHEMA_VERSION = 15
 
 
 BACKTEST_COLUMNS = {
@@ -248,6 +249,33 @@ INDUSTRY_MEMBERSHIP_COLUMNS = {
     "symbol": "symbol TEXT",
     "as_of": "as_of TEXT",
     "source": "source TEXT DEFAULT 'em'",
+    "updated_at": "updated_at TIMESTAMP",
+}
+
+# v15（D2）：ML 数据集 manifest 落库（dataset_id 主键；列表/字典字段 JSON 编码）。
+# 与 ml_models（D3）同属 v15——D2 先建 ml_datasets，D3 再增 ml_models，不另起版本号。
+ML_DATASETS_COLUMNS = {
+    "dataset_id": "dataset_id TEXT",
+    "n_rows": "n_rows INTEGER NOT NULL DEFAULT 0",
+    "n_positive": "n_positive INTEGER NOT NULL DEFAULT 0",
+    "positive_rate": "positive_rate REAL",
+    "start_date": "start_date TEXT",
+    "end_date": "end_date TEXT",
+    "max_trade_date": "max_trade_date TEXT",
+    "horizon": "horizon INTEGER NOT NULL DEFAULT 5",
+    "aux_horizon": "aux_horizon INTEGER NOT NULL DEFAULT 10",
+    "index_code": "index_code TEXT",
+    "industry_point_in_time": "industry_point_in_time INTEGER NOT NULL DEFAULT 0",
+    "csv_path": "csv_path TEXT",
+    "symbols_json": "symbols_json TEXT",
+    "rejected_json": "rejected_json TEXT",
+    "groups_json": "groups_json TEXT",
+    "feature_columns_json": "feature_columns_json TEXT",
+    "cost_model_json": "cost_model_json TEXT",
+    "profile_snapshot_json": "profile_snapshot_json TEXT",
+    "data_versions_json": "data_versions_json TEXT",
+    "warnings_json": "warnings_json TEXT",
+    "created_at": "created_at TIMESTAMP",
     "updated_at": "updated_at TIMESTAMP",
 }
 
@@ -681,6 +709,35 @@ def init_database(path: Path | None = None) -> Path:
             "CREATE INDEX IF NOT EXISTS idx_industry_membership_symbol "
             "ON industry_membership(symbol)"
         )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS ml_datasets (
+                dataset_id TEXT PRIMARY KEY,
+                n_rows INTEGER NOT NULL DEFAULT 0,
+                n_positive INTEGER NOT NULL DEFAULT 0,
+                positive_rate REAL,
+                start_date TEXT,
+                end_date TEXT,
+                max_trade_date TEXT,
+                horizon INTEGER NOT NULL DEFAULT 5,
+                aux_horizon INTEGER NOT NULL DEFAULT 10,
+                index_code TEXT,
+                industry_point_in_time INTEGER NOT NULL DEFAULT 0,
+                csv_path TEXT,
+                symbols_json TEXT,
+                rejected_json TEXT,
+                groups_json TEXT,
+                feature_columns_json TEXT,
+                cost_model_json TEXT,
+                profile_snapshot_json TEXT,
+                data_versions_json TEXT,
+                warnings_json TEXT,
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        _ensure_columns(connection, "ml_datasets", ML_DATASETS_COLUMNS)
         integrity = connection.execute("PRAGMA integrity_check").fetchone()
         if not integrity or integrity[0] != "ok":
             raise RuntimeError(f"SQLite integrity check failed for {target}: {integrity}")
@@ -1127,6 +1184,152 @@ def stock_catalog_industries(path: Path | None = None) -> Mapping[str, str]:
             "WHERE industry IS NOT NULL AND industry <> ''"
         ).fetchall()
     return {str(symbol): str(industry) for symbol, industry in rows}
+
+
+# ---------------------------------------------------------------------------
+# v15（D2）：ML 数据集 manifest 落库
+# ---------------------------------------------------------------------------
+# manifest 中列表/字典字段以 JSON 文本存储；register 序列化、load/list 反序列化，
+# 调用方（ml.dataset）始终拿到/传入原生 Python 对象。
+_DATASET_JSON_FIELDS = (
+    "symbols",
+    "rejected",
+    "groups",
+    "feature_columns",
+    "cost_model",
+    "profile_snapshot",
+    "data_versions",
+    "warnings",
+)
+
+
+def register_dataset(manifest: Mapping[str, Any], path: Path | None = None) -> str:
+    """写入/更新 ``ml_datasets``（D2）。按 ``dataset_id`` upsert 幂等，返回 dataset_id。
+
+    ``manifest`` 的列表/字典字段（symbols/rejected/groups/feature_columns/cost_model/
+    profile_snapshot/data_versions/warnings）以 JSON 编码落库；标量字段直接存。
+    """
+    dataset_id = str(manifest["dataset_id"])
+
+    def _dump(key: str) -> str:
+        return json.dumps(manifest.get(key), ensure_ascii=False, default=str)
+
+    target = init_database(path)
+    with sqlite3.connect(target, timeout=30) as connection:
+        connection.execute(
+            """
+            INSERT INTO ml_datasets (
+                dataset_id, n_rows, n_positive, positive_rate,
+                start_date, end_date, max_trade_date, horizon, aux_horizon,
+                index_code, industry_point_in_time, csv_path,
+                symbols_json, rejected_json, groups_json, feature_columns_json,
+                cost_model_json, profile_snapshot_json, data_versions_json,
+                warnings_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                      CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            ON CONFLICT(dataset_id) DO UPDATE SET
+                n_rows = excluded.n_rows,
+                n_positive = excluded.n_positive,
+                positive_rate = excluded.positive_rate,
+                start_date = excluded.start_date,
+                end_date = excluded.end_date,
+                max_trade_date = excluded.max_trade_date,
+                horizon = excluded.horizon,
+                aux_horizon = excluded.aux_horizon,
+                index_code = excluded.index_code,
+                industry_point_in_time = excluded.industry_point_in_time,
+                csv_path = excluded.csv_path,
+                symbols_json = excluded.symbols_json,
+                rejected_json = excluded.rejected_json,
+                groups_json = excluded.groups_json,
+                feature_columns_json = excluded.feature_columns_json,
+                cost_model_json = excluded.cost_model_json,
+                profile_snapshot_json = excluded.profile_snapshot_json,
+                data_versions_json = excluded.data_versions_json,
+                warnings_json = excluded.warnings_json,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (
+                dataset_id,
+                int(manifest.get("n_rows", 0) or 0),
+                int(manifest.get("n_positive", 0) or 0),
+                manifest.get("positive_rate"),
+                manifest.get("start_date"),
+                manifest.get("end_date"),
+                manifest.get("max_trade_date"),
+                int(manifest.get("horizon", 5) or 5),
+                int(manifest.get("aux_horizon", 10) or 10),
+                manifest.get("index_code"),
+                1 if manifest.get("industry_point_in_time") else 0,
+                manifest.get("csv_path"),
+                _dump("symbols"),
+                _dump("rejected"),
+                _dump("groups"),
+                _dump("feature_columns"),
+                _dump("cost_model"),
+                _dump("profile_snapshot"),
+                _dump("data_versions"),
+                _dump("warnings"),
+            ),
+        )
+    return dataset_id
+
+
+def _row_to_dataset_manifest(row: Mapping[str, Any]) -> Dict[str, Any]:
+    """把 ml_datasets 行解码为原生 manifest dict（JSON 字段反序列化）。"""
+    data = dict(row)  # sqlite3.Row 无 .get()，先转 dict
+
+    def _load(key: str) -> Any:
+        raw = data.get(f"{key}_json")
+        if raw is None:
+            return None
+        try:
+            return json.loads(raw)
+        except (TypeError, ValueError):
+            return None
+
+    manifest: Dict[str, Any] = {
+        "dataset_id": data["dataset_id"],
+        "n_rows": data["n_rows"],
+        "n_positive": data["n_positive"],
+        "positive_rate": data["positive_rate"],
+        "start_date": data["start_date"],
+        "end_date": data["end_date"],
+        "max_trade_date": data["max_trade_date"],
+        "horizon": data["horizon"],
+        "aux_horizon": data["aux_horizon"],
+        "index_code": data["index_code"],
+        "industry_point_in_time": bool(data["industry_point_in_time"]),
+        "csv_path": data["csv_path"],
+        "created_at": data.get("created_at"),
+    }
+    for key in _DATASET_JSON_FIELDS:
+        manifest[key] = _load(key)
+    return manifest
+
+
+def load_dataset_manifest(
+    dataset_id: str, path: Path | None = None
+) -> Optional[Dict[str, Any]]:
+    """读取某数据集 manifest（JSON 字段解码）；不存在返回 ``None``。"""
+    target = init_database(path)
+    with sqlite3.connect(target, timeout=30) as connection:
+        connection.row_factory = sqlite3.Row
+        row = connection.execute(
+            "SELECT * FROM ml_datasets WHERE dataset_id = ?", (dataset_id,)
+        ).fetchone()
+    return _row_to_dataset_manifest(row) if row else None
+
+
+def list_datasets(path: Path | None = None) -> List[Dict[str, Any]]:
+    """列出全部数据集 manifest（按 created_at 降序、再按 dataset_id），JSON 字段解码。"""
+    target = init_database(path)
+    with sqlite3.connect(target, timeout=30) as connection:
+        connection.row_factory = sqlite3.Row
+        rows = connection.execute(
+            "SELECT * FROM ml_datasets ORDER BY created_at DESC, dataset_id DESC"
+        ).fetchall()
+    return [_row_to_dataset_manifest(row) for row in rows]
 
 
 def upsert_stock_catalog(

@@ -12,14 +12,17 @@ from ripple_tradePilot.storage.__main__ import main as initialize_storage
 from ripple_tradePilot.storage.database import (
     DATABASE_SCHEMA_VERSION,
     industry_board_for_symbol,
+    list_datasets,
     list_stock_catalog,
     load_daily_bars,
+    load_dataset_manifest,
     load_index_bars,
     load_industry_board_bars,
     load_industry_boards,
     load_industry_membership,
     load_market_daily,
     record_market_daily,
+    register_dataset,
     stock_catalog_industries,
     upsert_daily_bars,
     upsert_index_daily,
@@ -693,7 +696,6 @@ class SchemaV14MigrationTest(unittest.TestCase):
             with sqlite3.connect(target) as connection:
                 version = connection.execute("PRAGMA user_version").fetchone()[0]
             self.assertEqual(version, DATABASE_SCHEMA_VERSION)
-            self.assertEqual(version, 14)
 
     def test_fresh_db_has_industry_tables(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -734,7 +736,7 @@ class SchemaV14MigrationTest(unittest.TestCase):
             self.assertIn("industry_membership", tables)
             with sqlite3.connect(target) as connection:
                 version = connection.execute("PRAGMA user_version").fetchone()[0]
-            self.assertEqual(version, 14)
+            self.assertEqual(version, DATABASE_SCHEMA_VERSION)
 
     def test_init_database_idempotent_for_v14(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -888,6 +890,162 @@ class SchemaV14MigrationTest(unittest.TestCase):
             )
             industries = stock_catalog_industries(target)
             self.assertEqual(industries, {"600000.SH": "银行", "000001.SZ": "银行"})
+
+
+def _sample_manifest(dataset_id="ds_abc123def456"):
+    """构造一个具代表性的 D2 manifest dict（标量 + 全部 JSON 字段）。"""
+    return {
+        "dataset_id": dataset_id,
+        "n_rows": 882,
+        "n_positive": 431,
+        "positive_rate": 0.4887,
+        "start_date": "20240102",
+        "end_date": "20250218",
+        "max_trade_date": "20250218",
+        "horizon": 5,
+        "aux_horizon": 10,
+        "index_code": "000300.SH",
+        "industry_point_in_time": False,
+        "csv_path": "data/ml/ds_abc123def456.csv.gz",
+        "symbols": ["002022.SZ", "600309.SH"],
+        "rejected": [{"symbol": "999999.SH", "reason": "rebase_suspect@20240730"}],
+        "groups": ["signal", "price_volume", "market", "industry"],
+        "feature_columns": ["rec_buy", "ret_5", "idx_ret_5", "board_ret_5"],
+        "cost_model": {"fee_rate": 0.0003, "stamp_duty": 0.0005},
+        "profile_snapshot": {"002022.SZ": {"board_code": "BK0475"}},
+        "data_versions": {"002022.SZ": "synth|20260417|seed100"},
+        "warnings": ["industry_point_in_time=False：行业为最新单快照，存在前视风险"],
+    }
+
+
+class SchemaV15MigrationTest(unittest.TestCase):
+    """v15（D2 ``ml_datasets`` 数据集注册表）迁移、幂等、唯一约束与读写往返。"""
+
+    ML_DATASETS_COLS = {
+        "dataset_id", "n_rows", "n_positive", "positive_rate",
+        "start_date", "end_date", "max_trade_date", "horizon", "aux_horizon",
+        "index_code", "industry_point_in_time", "csv_path",
+        "symbols_json", "rejected_json", "groups_json", "feature_columns_json",
+        "cost_model_json", "profile_snapshot_json", "data_versions_json",
+        "warnings_json", "created_at", "updated_at",
+    }
+
+    def _tables(self, target):
+        with sqlite3.connect(target) as connection:
+            return {
+                row[0]
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )
+            }
+
+    def _columns(self, target, table):
+        with sqlite3.connect(target) as connection:
+            return {row[1] for row in connection.execute(f"PRAGMA table_info({table})")}
+
+    def test_fresh_db_has_ml_datasets_table(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target = Path(temp_dir) / "fresh15.db"
+            init_database(target)
+            self.assertIn("ml_datasets", self._tables(target))
+            self.assertTrue(
+                self.ML_DATASETS_COLS.issubset(self._columns(target, "ml_datasets"))
+            )
+            with sqlite3.connect(target) as connection:
+                version = connection.execute("PRAGMA user_version").fetchone()[0]
+            self.assertEqual(version, DATABASE_SCHEMA_VERSION)
+            self.assertEqual(version, 15)
+
+    def test_legacy_v14_db_upgrades_to_v15(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target = Path(temp_dir) / "legacy-v14.db"
+            init_database(target)
+            with sqlite3.connect(target) as connection:
+                connection.execute("DROP TABLE ml_datasets")
+                connection.execute("PRAGMA user_version=14")
+            self.assertNotIn("ml_datasets", self._tables(target))
+
+            init_database(target)  # 重新初始化应补建 v15 表
+
+            self.assertIn("ml_datasets", self._tables(target))
+            with sqlite3.connect(target) as connection:
+                version = connection.execute("PRAGMA user_version").fetchone()[0]
+            self.assertEqual(version, DATABASE_SCHEMA_VERSION)
+
+    def test_init_database_idempotent_for_v15(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target = Path(temp_dir) / "idem15.db"
+            init_database(target)
+            init_database(target)  # 第二次不得抛错或重复建表
+            self.assertIn("ml_datasets", self._tables(target))
+
+    def test_ml_datasets_primary_key_is_dataset_id(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target = Path(temp_dir) / "pk15.db"
+            init_database(target)
+            with sqlite3.connect(target) as connection:
+                pk_cols = [
+                    row[1]
+                    for row in connection.execute("PRAGMA table_info(ml_datasets)")
+                    if row[5]  # pk flag
+                ]
+            self.assertEqual(pk_cols, ["dataset_id"])
+
+    def test_register_dataset_and_load_roundtrip(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target = Path(temp_dir) / "reg15.db"
+            manifest = _sample_manifest()
+            dataset_id = register_dataset(manifest, target)
+            self.assertEqual(dataset_id, manifest["dataset_id"])
+
+            loaded = load_dataset_manifest(dataset_id, target)
+            self.assertIsNotNone(loaded)
+            # 标量字段原样回读
+            self.assertEqual(loaded["n_rows"], 882)
+            self.assertEqual(loaded["n_positive"], 431)
+            self.assertAlmostEqual(loaded["positive_rate"], 0.4887)
+            self.assertEqual(loaded["horizon"], 5)
+            self.assertEqual(loaded["aux_horizon"], 10)
+            self.assertEqual(loaded["index_code"], "000300.SH")
+            self.assertEqual(loaded["csv_path"], "data/ml/ds_abc123def456.csv.gz")
+            # JSON 字段解码回原生 list/dict
+            self.assertEqual(loaded["symbols"], ["002022.SZ", "600309.SH"])
+            self.assertEqual(loaded["groups"], ["signal", "price_volume", "market", "industry"])
+            self.assertEqual(loaded["rejected"][0]["symbol"], "999999.SH")
+            self.assertEqual(loaded["cost_model"]["fee_rate"], 0.0003)
+            self.assertEqual(
+                loaded["profile_snapshot"]["002022.SZ"]["board_code"], "BK0475"
+            )
+            self.assertEqual(loaded["data_versions"]["002022.SZ"], "synth|20260417|seed100")
+            self.assertIn("industry_point_in_time=False", loaded["warnings"][0])
+            # bool 往返（INTEGER 0 → False）
+            self.assertIs(loaded["industry_point_in_time"], False)
+            self.assertIsNotNone(loaded["created_at"])
+
+    def test_register_dataset_upsert_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target = Path(temp_dir) / "upsert15.db"
+            register_dataset(_sample_manifest(), target)
+            # 同 dataset_id 重写 n_rows → upsert 覆盖，不产生第二行
+            register_dataset({**_sample_manifest(), "n_rows": 999}, target)
+            datasets = list_datasets(target)
+            self.assertEqual(len(datasets), 1)
+            self.assertEqual(datasets[0]["n_rows"], 999)
+
+    def test_load_missing_dataset_returns_none(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target = Path(temp_dir) / "missing15.db"
+            init_database(target)
+            self.assertIsNone(load_dataset_manifest("nope", target))
+            self.assertEqual(list_datasets(target), [])
+
+    def test_list_datasets_returns_all(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target = Path(temp_dir) / "list15.db"
+            register_dataset(_sample_manifest("ds_a"), target)
+            register_dataset(_sample_manifest("ds_b"), target)
+            ids = {d["dataset_id"] for d in list_datasets(target)}
+            self.assertEqual(ids, {"ds_a", "ds_b"})
 
 
 if __name__ == "__main__":

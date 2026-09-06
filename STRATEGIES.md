@@ -392,6 +392,63 @@ symbols_unresolved`——**解析不出的 symbol 诚实记入 unresolved，绝�
 `market_daily`；② `MarketDataService.refresh_indexes` 刷 4 指数；③ 可选行业增量（`monitor.refresh_industry`
 默认 false，开启后按 config 股票池调 `refresh_for_symbols`）。
 
+### ML 特征管道与数据集（D1/D2 · schema v15）
+
+C 阶段把指数/宽度/行业落库后，D1 才有原料把"市场环境"喂进个股信号。D1（`ml/features.py`）
+建特征、D2（`ml/dataset.py`）建数据集，两者共同遵守一条**铁律**：
+
+> **训练与线上打分调同一个函数 `symbol_feature_frame`**——同一 (symbol, trade_date) 在
+> `build_dataset`（训练）与 D5 `scoring`（线上）算出的特征逐列一致，从根上杜绝 train/serve
+> 偏斜。特征**只依赖 DB 可重建字段**（日线/指数/宽度/板块），不掺任何运行时才有的状态。
+
+**四组特征，`--groups` 可开关**（路线图"每次只加一组验证增益"的机制保障）：
+
+| 组 | 代表特征 | 来源 |
+|----|----------|------|
+| `signal` | `buy_count`/`sell_count`/`vote_threshold`、`rec_*` one-hot、各组件 `comp_*`(±1/0)、`state_age`、`max_strength` | 直接调 A 阶段 `signals/`——规则引擎输出即特征 |
+| `price_volume` | `ret_1/5/20`、`close_ma5/20_ratio`、`rsi14`、`bb_pos`/`bb_width`(+60日分位)、`vol_ratio`、`amount_z20`、`breakout_20`、`atr_pct`(+60日均值比)、`high_low_range` | 复用 `indicators.py`，与 dashboard/monitor/回测**逐位一致** |
+| `market` | `idx_ret_5/20`、`idx_close_ma20_ratio`、`idx_vol20`、`up_ratio`(+ma5)、`limit_up_count`、`total_amount_z` | C1 `index_daily` + C2 `market_daily` |
+| `industry` | `board_ret_5/20`、`board_close_ma20_ratio`、`rel_strength_5/20`(个股−板块) | C3 `industry_board_bars` + `industry_membership` |
+
+**因果性是硬约束**：每个特征在 T 日只用 ≤T 的数据；标签用 T+1 开盘（见 `docs/prediction-target.md`）。
+`assert_no_lookahead` 是开发期探针——把序列**尾部 10 根 bar 换成极端值**（交替 ×10/×0.1，
+避免比例特征对均匀缩放的尺度不变性掩盖泄漏），断言 T≤n−11 的所有特征行**逐列不变**；
+尾行确因扰动剧变则证明探针非平凡。缺组**绝不插补/造假**：market/industry 无数据时填 NaN
+并置 `_has_market=0`/`_has_industry=0` 标志列，让下游模型自己识别"这行没有市场环境信息"。
+
+**D2 数据集构建** `build_dataset(symbols, start, end, horizon=5, aux_horizon=10, groups,
+profile_resolver, ...) -> DatasetManifest`，每标的一条流水线：
+
+1. `load_daily_bars` → 无数据则 `rejected`（reason `no_data`）；
+2. **A9 复权审计门**：`audit_series(rows, tol=0.01).clean == False` → 拒入
+   （reason `rebase_suspect@<date>(diff=<x>)`），混接嫌疑的序列绝不进训练集；
+3. 解析 `ProfileSpec`（`profile_resolver` 缺省走 `backtest_profile.default_profile`）；
+4. `symbol_feature_frame` 出特征 + `label_series(5)`/`label_series(10)` 出标签；
+5. 丢标签缺失行、按 `[start,end]` 过滤、`label_win` 转 int。
+
+产物 = `data/ml/<dataset_id>.csv.gz`（pandas gzip，零新依赖）+ `<dataset_id>.manifest.json`，
+**`dataset_id` = 帧内容 + 参数的 sha256 前 12 位**，故重复构建幂等命中同一 ID。manifest 落
+**v15 新表 `ml_datasets`**（`register_dataset` 按 dataset_id upsert；列表/dict 字段以 JSON 列
+编码，`load_dataset_manifest`/`list_datasets` 解码回原生），记全 provenance：行数/正例率、
+日期范围、`max_trade_date` 新鲜度戳、symbols、groups、cost_model、**每标的 profile 解析快照**
+（kind/vote_threshold/组件 + board_code）、**每标的 data_version**（溯源到 A9 的
+`source|anchor|ts`）、`industry_point_in_time=False` 前视警告（承接 C3 单快照局限）。
+
+**CLI**（零网络、纯读 DB + 写文件）：
+
+```
+tradepilot ml build-dataset --pool config|watchlist|catalog [--symbols A,B] \
+    [--start --end --horizon --aux-horizon --groups signal,price_volume,market,industry] \
+    [--index-code 000300.SH --out-dir data/ml --no-register]
+```
+
+`--pool catalog` 取全库有日线的标的；`--symbols` 覆盖池；非法组或空池 exit 2。
+
+> ⚠️ **诚实定位**：本地数据停在 2026-04-17、观察池仅 2 只，D 阶段验收**以 `tests/synth.py`
+> 合成夹具跑通全管道为准**（3 标的×300 天+指数+板块）。在数据恢复并扩池前，任何由此产出的
+> 数据集/模型都只是**机制验证**，不是可交易信号——D3 `promote` 门禁会以样本量/新鲜度/OOS
+> Brier 三道闸默认拒绝晋升，UI 标 `demo`/`stale`。
+
 ### 监控统一切日线（A3）
 
 改造前 monitor 与网页/CLI 回测**口径分裂**：监控每标的每轮拉近 5 天 1min 线（N 次网络/轮、
