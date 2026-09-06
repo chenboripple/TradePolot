@@ -29,6 +29,7 @@ from ripple_tradePilot.signals.backtest_profile import (
     resolve_backtest_strategy,
 )
 from ripple_tradePilot.data.market_service import (
+    INDEX_CODES,
     aggregate_breadth,
     load_index_bars,
 )
@@ -41,6 +42,10 @@ from ripple_tradePilot.storage.database import (
     init_database,
     list_stock_catalog,
     load_daily_bars,
+    load_industry_board_bars,
+    load_industry_boards,
+    load_industry_membership,
+    load_market_daily,
     load_stock_quotes,
     stock_catalog_name,
     stock_catalog_names,
@@ -759,6 +764,109 @@ def market_overview(user: Dict = Depends(required_user)):
         return {"data": _market_overview_data()}
     except StockDataUnavailableError as error:
         raise _stock_error(error) from error
+
+
+# ---------------------------------------------------------------------------
+# C4：市场/行业历史只读端点（纯读 DB，不触发任何网络；登录可见）
+# ---------------------------------------------------------------------------
+_INDEX_NAME_BY_CODE = {code: name for code, name in INDEX_CODES}
+
+
+def _validate_date_param(value: Optional[str], name: str) -> Optional[str]:
+    """校验 ``YYYYMMDD`` 日期查询参数；空 → None，非法 → 422。"""
+    if value is None:
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    if len(text) != 8 or not text.isdigit():
+        raise HTTPException(status_code=422, detail=f"{name} 应为 YYYYMMDD 8 位数字")
+    return text
+
+
+@app.get("/api/market/history")
+def market_history(
+    user: Dict = Depends(required_user),
+    index_code: str = Query(default="000300.SH"),
+    start: Optional[str] = Query(default=None),
+    end: Optional[str] = Query(default=None),
+    limit: int = Query(default=250, ge=1, le=2000),
+):
+    """指数日线历史（C1 落库的 ``index_daily``）。``fetch=False`` 保证只读、零网络。"""
+    rows = load_index_bars(
+        index_code,
+        start_date=_validate_date_param(start, "start"),
+        end_date=_validate_date_param(end, "end"),
+        fetch=False,
+    )[-limit:]
+    return {
+        "data": {
+            "index_code": index_code,
+            "name": _INDEX_NAME_BY_CODE.get(index_code, ""),
+            "count": len(rows),
+            "rows": [dict(row) for row in rows],
+        }
+    }
+
+
+@app.get("/api/market/breadth")
+def market_breadth_history(
+    user: Dict = Depends(required_user),
+    start: Optional[str] = Query(default=None),
+    end: Optional[str] = Query(default=None),
+    limit: int = Query(default=250, ge=1, le=2000),
+):
+    """市场宽度历史（C2 落库的 ``market_daily``）。
+
+    无免费历史宽度 API → 增量积累制，新库可能为空（见 STRATEGIES.md C1/C2）。
+    """
+    rows = load_market_daily(
+        start_date=_validate_date_param(start, "start"),
+        end_date=_validate_date_param(end, "end"),
+    )[-limit:]
+    return {"data": {"count": len(rows), "rows": [dict(row) for row in rows]}}
+
+
+@app.get("/api/industry/boards")
+def industry_boards(user: Dict = Depends(required_user)):
+    """行业板块登记（C3 落库的 ``industry_boards``）。"""
+    boards = load_industry_boards()
+    return {"data": {"count": len(boards), "boards": [dict(row) for row in boards]}}
+
+
+@app.get("/api/industry/boards/{board_code}/bars")
+def industry_board_bars(
+    board_code: str,
+    user: Dict = Depends(required_user),
+    start: Optional[str] = Query(default=None),
+    end: Optional[str] = Query(default=None),
+    limit: int = Query(default=250, ge=1, le=2000),
+):
+    """板块日线历史（C3 落库的 ``industry_board_bars``）。"""
+    start_date = _validate_date_param(start, "start")
+    end_date = _validate_date_param(end, "end")
+    rows = load_industry_board_bars(board_code)
+    if start_date:
+        rows = [row for row in rows if row["trade_date"] >= start_date]
+    if end_date:
+        rows = [row for row in rows if row["trade_date"] <= end_date]
+    rows = rows[-limit:]
+    return {"data": {"board_code": board_code, "count": len(rows), "rows": [dict(row) for row in rows]}}
+
+
+@app.get("/api/industry/boards/{board_code}/members")
+def industry_board_members(board_code: str, user: Dict = Depends(required_user)):
+    """板块成分股最新快照（C3 落库的 ``industry_membership``，附 catalog 名称）。"""
+    names = stock_catalog_names()
+    members = [
+        {
+            "symbol": row["symbol"],
+            "name": names.get(row["symbol"], row["symbol"]),
+            "as_of": row["as_of"],
+        }
+        for row in load_industry_membership(board_code)
+    ]
+    return {"data": {"board_code": board_code, "count": len(members), "members": members}}
 
 
 _BACKTEST_DEFAULT_STRATEGY = "rsi"

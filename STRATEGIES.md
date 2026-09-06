@@ -320,7 +320,7 @@ tushare pro.index_daily  ──▶  akshare index_zh_a_hist  ──▶  akshare 
 **C2 市场宽度**——⚠️ **诚实面对现实：没有免费的历史宽度 API**。akshare/tushare 免费档都
 不提供"某天有多少只涨停/多少只上涨"的历史序列，因此 `market_daily` 采用**增量积累制**：
 
-> monitor 收盘例程（C5）/ `tradepilot data refresh-market`（C4）用**当日** `stock_quotes`
+> monitor 收盘例程（C5）/ `tradepilot data refresh --market`（C4）用**当日** `stock_quotes`
 > 终态快照经 `aggregate_breadth` 聚合后写入。每跑一天积一天，历史**无法事后批量回填**。
 
 这带来一个必须写明的**数据局限**：
@@ -340,6 +340,57 @@ A7 的 `price_limit_for_symbol(symbol)` **分板块判定**（主板 10% / 创�
 > A 股价格四舍五入到 0.01 元会让低价股的真实涨停显示成 ~9.95%，相对阈值会漏掉它们；
 > 绝对 0.2pp 既精确保留了主板原口径（阈值 9.8），又把创业板/科创板修正到 19.8、北交所 29.8。
 > 这是刻意不统一的两处容差，详见 `data/market_service.py` 注释。
+
+### 行业数据基建（C3/C4/C5 · schema v14）
+
+改造前个股只有 `stock_basic` 带的一个**静态行业标签**（"银行"/"小金属"），既无行业指数行情、
+也无成分股归属，D 阶段"个股 vs 所属行业板块"的相对强弱特征根本无从算起。C3 把东财行业板块
+落进三张独立表，C4 给出 CLI/只读 API，C5 把它挂进 monitor 收盘例程（默认关）。
+
+v14 再增三张表（与 C1/C2 同属 v14，不另起版本号）：
+
+| 表 | 用途 |
+|----|------|
+| `industry_boards` | 板块登记表：`board_code`（主键，如 BK0475）·`board_name`（如"银行"）·`source='em'`。name↔code 映射的唯一来源 |
+| `industry_board_bars` | 板块日线 OHLC·pct_chg·amount·turnover_rate。冲突键 `UNIQUE(board_code, trade_date)` |
+| `industry_membership` | 成分股归属：主键 `(board_code, symbol)` + `as_of` 观察日 |
+
+**东财为唯一主源**（探查确认 tushare 120 积分档无免费行业指数历史）：`stock_board_industry_name_em`
+（板块登记）/ `stock_board_industry_hist_em`（板块日线）/ `stock_board_industry_cons_em`（成分股）。
+两个必须写明的接口坑：
+
+- `hist_em` 与 `cons_em` 的入参是板块**名称**而非代码——服务内部用 `industry_boards` 登记的
+  name↔code 映射桥接：拉数传 name、落库记 code。
+- `cons_em` 返回 **6 位裸代码**（"600000"），经 `StockDataService.normalize_symbol` 补后缀
+  （→"600000.SH"）；malformed 跳过。列名映射集中在 `data/industry_service.py` 顶部常量表，
+  东财改列名只需改一处。
+
+**部分成功 + 显式 RefreshReport**（沿用 C1 tier 降级哲学）：`refresh_for_symbols(symbols)` 只为
+股票池所属板块拉数据——先解析 symbol→板块（**DB 成分快照优先**，兜底用 `stock_catalog.industry`
+静态标签按板块名**模糊匹配**），板块去重后逐板块拉，每板块独立 try/except + 限流 sleep（可配
+`data.industry_rate_limit_delay`，默认 0.5s）。报告含 `boards_refreshed/boards_failed/
+symbols_unresolved`——**解析不出的 symbol 诚实记入 unresolved，绝不臆造板块归属**；失败板块的
+行业特征在 D 阶段自动 NaN 降级。
+
+> ⚠️ **成分股是"最新单快照"而非逐日历史**：`industry_membership` 主键 `(board_code, symbol)`
+> 决定同一 (板块, 个股) 只存最新 `as_of`，**不是 point-in-time**。个股调仓换板块后旧归属被覆盖。
+> D 阶段读取时按 `as_of ≤ trade_date` 取最近快照，并在数据集 manifest 标
+> **`industry_point_in_time=False`** 前视警告——诚实承认"用今天的板块归属回看历史"存在轻微
+> 幸存者/前视偏差，而非假装能重建任意历史日的成分。
+
+**C4 入口**（纯读 DB、零网络）：
+
+- CLI：`tradepilot data refresh [--market] [--industry] [--pool config|watchlist] [--days N]`
+  ——`--market` 刷指数+宽度，`--industry` 按股票池刷板块，两个 flag 至少给一个（否则 exit 2）。
+- API（登录可见）：`GET /api/market/history`、`/api/market/breadth`、`/api/industry/boards`、
+  `/api/industry/boards/{code}/bars`、`/api/industry/boards/{code}/members`。**只读端点一律
+  `fetch=False`**——空库时诚实返回空，绝不触发网络补拉（`test_history_never_fetches_on_empty_db`
+  钉死此约束）。前端本期不强制消费，D 阶段环境面板预留。
+
+**C5 收盘例程接入**（在 A3 finalize 末尾追加 `_finalize_market_data`，全部独立 try/except，
+单项失败不影响个股收盘重评/通知）：① `refresh_quotes` 终态 → `record_market_breadth` 写
+`market_daily`；② `MarketDataService.refresh_indexes` 刷 4 指数；③ 可选行业增量（`monitor.refresh_industry`
+默认 false，开启后按 config 股票池调 `refresh_for_symbols`）。
 
 ### 监控统一切日线（A3）
 

@@ -891,6 +891,71 @@ class MarketMonitor:
             await self.send_periodic_report(results)
             self._last_report_at = datetime.now()
 
+        # 5) C5：市场级数据落库（宽度/指数/可选行业），独立于个股通知，单项失败不影响其他
+        self._finalize_market_data(today, symbols)
+
+    def _finalize_market_data(self, today: str, symbols: List[dict]) -> None:
+        """C5：收盘例程的市场级数据落库（C2 宽度 → C1 指数 → 可选 C3 行业）。
+
+        全部独立 try/except——单项失败不影响其他，也不影响已完成的个股收盘重评/通知。
+        同步网络调用与上游 ``service.refresh`` 一致（收盘例程每交易日一次，非热路径）。
+        """
+        service = self._get_stock_service()
+
+        # 1) refresh_quotes 终态 → aggregate_breadth 写 market_daily（C2）
+        try:
+            service.refresh_quotes()
+        except Exception as e:
+            logger.warning(f"收盘全市场快照刷新失败，用库内既有快照聚合宽度：{e}")
+        try:
+            from ..data.market_service import record_market_breadth
+
+            rows = load_stock_quotes()
+            if rows:
+                breadth = record_market_breadth(today, rows, "snapshot")
+                logger.info(
+                    f"📊 市场宽度已落库（{today}）：上涨 {breadth['advancers']} / "
+                    f"下跌 {breadth['decliners']} / 涨停 {breadth['limit_up']} / "
+                    f"跌停 {breadth['limit_down']}"
+                )
+            else:
+                logger.warning("收盘无全市场快照，跳过市场宽度落库")
+        except Exception as e:
+            logger.error(f"市场宽度聚合/落库失败：{e}", exc_info=True)
+
+        # 2) refresh_index_daily（4 指数，三级降级链，部分成功）（C1）
+        try:
+            from ..data.market_service import MarketDataService
+
+            report = MarketDataService().refresh_indexes()
+            if report["failed"]:
+                logger.warning(
+                    f"指数日线刷新：成功 {len(report['refreshed'])} / "
+                    f"失败 {len(report['failed'])}（失败指数特征 D 阶段 NaN 降级）"
+                )
+            else:
+                logger.info(f"📈 指数日线已落库：{len(report['refreshed'])} 个指数")
+        except Exception as e:
+            logger.error(f"指数日线刷新失败：{e}", exc_info=True)
+
+        # 3) 可选行业增量（C3，monitor.refresh_industry 默认 false）
+        monitor_cfg = self.config.get("monitor", {}) if isinstance(self.config, dict) else {}
+        if not monitor_cfg.get("refresh_industry", False):
+            return
+        try:
+            from ..data.industry_service import IndustryDataService
+
+            pool = [str(s.get("code")) for s in symbols if s.get("code")]
+            if pool:
+                report = IndustryDataService().refresh_for_symbols(pool)
+                logger.info(
+                    f"🏭 行业板块刷新：目标 {report['boards_total']} → "
+                    f"成功 {len(report['boards_refreshed'])} / "
+                    f"失败 {len(report['boards_failed'])}"
+                )
+        except Exception as e:
+            logger.error(f"行业板块刷新失败：{e}", exc_info=True)
+
     # ------------------------------------------------------------------
     # 主循环
     # ------------------------------------------------------------------

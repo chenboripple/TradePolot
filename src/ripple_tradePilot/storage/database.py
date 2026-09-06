@@ -214,6 +214,43 @@ MARKET_DAILY_COLUMNS = {
     "updated_at": "updated_at TIMESTAMP",
 }
 
+# v14（C3）：行业板块基建。东财（akshare）为唯一主源（tushare 120 积分无免费行业指数
+# 历史）。三张表：industry_boards（板块登记）、industry_board_bars（板块日线）、
+# industry_membership（成分股最新快照 + as_of 观察日）。失败板块的特征组在 D 阶段自动
+# NaN 降级，绝不造假。board_code 用东财板块代码（如 BK0475）。
+INDUSTRY_BOARDS_COLUMNS = {
+    "board_code": "board_code TEXT",
+    "board_name": "board_name TEXT",
+    "source": "source TEXT DEFAULT 'em'",
+    "updated_at": "updated_at TIMESTAMP",
+}
+
+INDUSTRY_BOARD_BARS_COLUMNS = {
+    "id": "id INTEGER",
+    "board_code": "board_code TEXT",
+    "trade_date": "trade_date TEXT",
+    "open": "open REAL",
+    "high": "high REAL",
+    "low": "low REAL",
+    "close": "close REAL",
+    "pct_chg": "pct_chg REAL",
+    "amount": "amount REAL",
+    "turnover_rate": "turnover_rate REAL",
+    "source": "source TEXT DEFAULT ''",
+    "updated_at": "updated_at TIMESTAMP",
+}
+
+# PK(board_code, symbol)：每个板块对每只成分股保留一行"最新快照"，as_of 记录观察日。
+# 现状单快照（非逐日 point-in-time），D 阶段读取时按 as_of<=trade_date 取最新并标
+# industry_point_in_time=False 前视警告（诚实标注局限）。
+INDUSTRY_MEMBERSHIP_COLUMNS = {
+    "board_code": "board_code TEXT",
+    "symbol": "symbol TEXT",
+    "as_of": "as_of TEXT",
+    "source": "source TEXT DEFAULT 'em'",
+    "updated_at": "updated_at TIMESTAMP",
+}
+
 
 def database_path() -> Path:
     configured = os.getenv("TRADEPILOT_BACKTEST_DB")
@@ -592,6 +629,58 @@ def init_database(path: Path | None = None) -> Path:
             "CREATE INDEX IF NOT EXISTS idx_market_daily_date "
             "ON market_daily(trade_date DESC)"
         )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS industry_boards (
+                board_code TEXT PRIMARY KEY,
+                board_name TEXT NOT NULL DEFAULT '',
+                source TEXT NOT NULL DEFAULT 'em',
+                updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        _ensure_columns(connection, "industry_boards", INDUSTRY_BOARDS_COLUMNS)
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS industry_board_bars (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                board_code TEXT NOT NULL,
+                trade_date TEXT NOT NULL,
+                open REAL,
+                high REAL,
+                low REAL,
+                close REAL,
+                pct_chg REAL,
+                amount REAL,
+                turnover_rate REAL,
+                source TEXT NOT NULL DEFAULT '',
+                updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(board_code, trade_date)
+            )
+            """
+        )
+        _ensure_columns(connection, "industry_board_bars", INDUSTRY_BOARD_BARS_COLUMNS)
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_industry_board_bars_code_date "
+            "ON industry_board_bars(board_code, trade_date)"
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS industry_membership (
+                board_code TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                as_of TEXT NOT NULL DEFAULT '',
+                source TEXT NOT NULL DEFAULT 'em',
+                updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY(board_code, symbol)
+            )
+            """
+        )
+        _ensure_columns(connection, "industry_membership", INDUSTRY_MEMBERSHIP_COLUMNS)
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_industry_membership_symbol "
+            "ON industry_membership(symbol)"
+        )
         integrity = connection.execute("PRAGMA integrity_check").fetchone()
         if not integrity or integrity[0] != "ok":
             raise RuntimeError(f"SQLite integrity check failed for {target}: {integrity}")
@@ -842,6 +931,202 @@ def load_market_daily(
         connection.row_factory = sqlite3.Row
         rows = connection.execute(query, params).fetchall()
     return [dict(row) for row in rows]
+
+
+# ---------------------------------------------------------------------------
+# v14（C3）：行业板块基建（东财 akshare 为唯一主源）
+# ---------------------------------------------------------------------------
+def upsert_industry_boards(
+    records: Iterable[Mapping[str, Any]],
+    source: str = "em",
+    path: Path | None = None,
+) -> int:
+    """写入/更新行业板块登记表（C3）。``records`` 形如 ``{"board_code", "board_name"}``。
+
+    按 ``board_code`` 主键 upsert 幂等。
+    """
+    rows = list(records)
+    if not rows:
+        return 0
+    target = init_database(path)
+    with sqlite3.connect(target, timeout=30) as connection:
+        connection.executemany(
+            """
+            INSERT INTO industry_boards (board_code, board_name, source, updated_at)
+            VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(board_code) DO UPDATE SET
+                board_name = excluded.board_name,
+                source = excluded.source,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            [
+                (
+                    str(record.get("board_code")),
+                    str(record.get("board_name") or ""),
+                    source,
+                )
+                for record in rows
+                if record.get("board_code")
+            ],
+        )
+    return len(rows)
+
+
+def load_industry_boards(path: Path | None = None) -> List[Mapping[str, Any]]:
+    """读取板块登记表（按 board_code 升序）。离线只读，不触发网络。"""
+    target = init_database(path)
+    with sqlite3.connect(target, timeout=30) as connection:
+        connection.row_factory = sqlite3.Row
+        rows = connection.execute(
+            "SELECT board_code, board_name, source FROM industry_boards ORDER BY board_code"
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def upsert_industry_board_bars(
+    board_code: str,
+    rows: Iterable[Mapping[str, Any]],
+    source: str,
+    path: Path | None = None,
+) -> int:
+    """写入/更新某板块日线（C3）。``rows`` 的 ``trade_date`` 须为 ``YYYYMMDD``
+    （industry_service 落库前统一归一化），按 ``(board_code, trade_date)`` upsert 幂等。
+    """
+    records = list(rows)
+    if not records:
+        return 0
+    target = init_database(path)
+    with sqlite3.connect(target, timeout=30) as connection:
+        connection.executemany(
+            """
+            INSERT INTO industry_board_bars (
+                board_code, trade_date, open, high, low, close,
+                pct_chg, amount, turnover_rate, source, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(board_code, trade_date) DO UPDATE SET
+                open = excluded.open,
+                high = excluded.high,
+                low = excluded.low,
+                close = excluded.close,
+                pct_chg = excluded.pct_chg,
+                amount = excluded.amount,
+                turnover_rate = excluded.turnover_rate,
+                source = excluded.source,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            [
+                (
+                    board_code,
+                    row.get("trade_date"),
+                    row.get("open"),
+                    row.get("high"),
+                    row.get("low"),
+                    row.get("close"),
+                    row.get("pct_chg"),
+                    row.get("amount"),
+                    row.get("turnover_rate"),
+                    source,
+                )
+                for row in records
+            ],
+        )
+    return len(records)
+
+
+def load_industry_board_bars(
+    board_code: str, path: Path | None = None
+) -> List[Mapping[str, Any]]:
+    """纯 DB 读取某板块日线（升序）。离线只读，不触发网络。"""
+    target = init_database(path)
+    with sqlite3.connect(target, timeout=30) as connection:
+        connection.row_factory = sqlite3.Row
+        rows = connection.execute(
+            """
+            SELECT trade_date, open, high, low, close, pct_chg,
+                   amount, turnover_rate, source
+            FROM industry_board_bars
+            WHERE board_code = ?
+            ORDER BY trade_date
+            """,
+            (board_code,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def upsert_industry_membership(
+    board_code: str,
+    symbols: Iterable[str],
+    as_of: str,
+    source: str = "em",
+    path: Path | None = None,
+) -> int:
+    """写入/更新某板块成分股最新快照（C3）。
+
+    按 ``(board_code, symbol)`` upsert，``as_of`` 记录观察日（``YYYYMMDD``）。现状单快照
+    （非逐日 point-in-time）：成分变动靠下次刷新覆盖，离板旧行可能残留（D 阶段按
+    as_of<=trade_date 取最新并标前视警告，诚实标注此局限）。
+    """
+    unique_symbols = sorted({str(symbol) for symbol in symbols if symbol})
+    if not unique_symbols:
+        return 0
+    target = init_database(path)
+    with sqlite3.connect(target, timeout=30) as connection:
+        connection.executemany(
+            """
+            INSERT INTO industry_membership (board_code, symbol, as_of, source, updated_at)
+            VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(board_code, symbol) DO UPDATE SET
+                as_of = excluded.as_of,
+                source = excluded.source,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            [(board_code, symbol, as_of, source) for symbol in unique_symbols],
+        )
+    return len(unique_symbols)
+
+
+def load_industry_membership(
+    board_code: str | None = None, path: Path | None = None
+) -> List[Mapping[str, Any]]:
+    """读取成分股快照。给定 ``board_code`` 只返回该板块，否则全表（按 board_code, symbol）。"""
+    target = init_database(path)
+    query = "SELECT board_code, symbol, as_of, source FROM industry_membership"
+    params: List[Any] = []
+    if board_code:
+        query += " WHERE board_code = ?"
+        params.append(board_code)
+    query += " ORDER BY board_code, symbol"
+    with sqlite3.connect(target, timeout=30) as connection:
+        connection.row_factory = sqlite3.Row
+        rows = connection.execute(query, params).fetchall()
+    return [dict(row) for row in rows]
+
+
+def industry_board_for_symbol(symbol: str, path: Path | None = None) -> str | None:
+    """返回某股票所属板块代码（成分快照中 as_of 最新者；无则 None）。"""
+    target = init_database(path)
+    with sqlite3.connect(target, timeout=30) as connection:
+        row = connection.execute(
+            "SELECT board_code FROM industry_membership WHERE symbol = ? "
+            "ORDER BY as_of DESC, board_code LIMIT 1",
+            (symbol,),
+        ).fetchone()
+    return row[0] if row else None
+
+
+def stock_catalog_industries(path: Path | None = None) -> Mapping[str, str]:
+    """轻量读取 ``stock_catalog`` 的 symbol→industry 静态标签（C3 兜底模糊匹配用）。
+
+    东财成分快照拉取失败时，用此静态标签按板块名模糊匹配兜底；匹配不上则该股票行业
+    特征缺失（绝不造假）。只返回 industry 非空的条目。
+    """
+    target = init_database(path)
+    with sqlite3.connect(target, timeout=30) as connection:
+        rows = connection.execute(
+            "SELECT symbol, industry FROM stock_catalog "
+            "WHERE industry IS NOT NULL AND industry <> ''"
+        ).fetchall()
+    return {str(symbol): str(industry) for symbol, industry in rows}
 
 
 def upsert_stock_catalog(

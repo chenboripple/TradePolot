@@ -23,7 +23,12 @@ from ripple_tradePilot.monitor.main import FINALIZE_KV_KEY, REC_BUY, MarketMonit
 from ripple_tradePilot.monitor.price_alert import PriceAlertConfig
 from ripple_tradePilot.signals.components import ComponentVote
 from ripple_tradePilot.signals.voting import VoteDecision, VoteEvent
-from ripple_tradePilot.storage.database import init_database, upsert_daily_bars
+from ripple_tradePilot.storage.database import (
+    init_database,
+    load_market_daily,
+    upsert_daily_bars,
+    upsert_stock_quotes,
+)
 from ripple_tradePilot.storage.signal_ledger import kv_get, list_signals
 
 CONFIG = """
@@ -336,6 +341,85 @@ class FinalizeBodyTest(_MonitorBase):
         self.assertTrue(rows)
         self.assertTrue(all(row["provisional"] == 0 for row in rows))
         self.assertIn(rows[0]["recommendation"], ("BUY", "SELL", "HOLD", "CONFLICT"))
+
+
+class FinalizeMarketDataTest(_MonitorBase):
+    """C5：收盘例程市场级落库（C2 宽度 → C1 指数 → 可选 C3 行业），全部独立 try/except。"""
+
+    def _seed_quotes(self):
+        upsert_stock_quotes(
+            [
+                {"symbol": "600000.SH", "price": 10.0, "change_pct": 9.85, "amount": 1e9},
+                {"symbol": "000001.SZ", "price": 12.0, "change_pct": -1.0, "amount": 2e9},
+            ],
+            "synth",
+            self.db_path,
+        )
+
+    def test_writes_breadth_and_refreshes_indexes(self):
+        self._seed_quotes()
+        self.monitor._stock_service = FakeStockService()
+        with patch(
+            "ripple_tradePilot.data.market_service.MarketDataService.refresh_indexes",
+            return_value={"refreshed": [{"index_code": "000300.SH"}], "failed": []},
+        ) as mock_idx:
+            self.monitor._finalize_market_data("20260904", [{"code": SYMBOL}])
+        mock_idx.assert_called_once()
+        rows = load_market_daily(self.db_path)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["trade_date"], "20260904")
+        self.assertEqual(rows[0]["limit_up"], 1)    # 600000 主板 +9.85 ≥9.8 → 涨停
+        self.assertEqual(rows[0]["advancers"], 1)
+        self.assertEqual(rows[0]["decliners"], 1)
+
+    def test_index_failure_does_not_block_breadth(self):
+        self._seed_quotes()
+        self.monitor._stock_service = FakeStockService()
+        with patch(
+            "ripple_tradePilot.data.market_service.MarketDataService.refresh_indexes",
+            side_effect=RuntimeError("index down"),
+        ):
+            self.monitor._finalize_market_data("20260904", [{"code": SYMBOL}])
+        # 指数失败被独立 try/except 吞掉，宽度仍落库
+        self.assertEqual(len(load_market_daily(self.db_path)), 1)
+
+    def test_no_snapshot_skips_breadth_but_still_refreshes_indexes(self):
+        self.monitor._stock_service = FakeStockService()  # 不 seed 快照
+        with patch(
+            "ripple_tradePilot.data.market_service.MarketDataService.refresh_indexes",
+            return_value={"refreshed": [], "failed": []},
+        ) as mock_idx:
+            self.monitor._finalize_market_data("20260904", [{"code": SYMBOL}])
+        mock_idx.assert_called_once()
+        self.assertEqual(load_market_daily(self.db_path), [])  # 无快照 → 无宽度行
+
+    def test_industry_skipped_by_default(self):
+        self._seed_quotes()
+        self.monitor._stock_service = FakeStockService()
+        with patch(
+            "ripple_tradePilot.data.market_service.MarketDataService.refresh_indexes",
+            return_value={"refreshed": [], "failed": []},
+        ), patch(
+            "ripple_tradePilot.data.industry_service.IndustryDataService.refresh_for_symbols"
+        ) as mock_ind:
+            self.monitor._finalize_market_data("20260904", [{"code": SYMBOL}])
+        mock_ind.assert_not_called()  # monitor.refresh_industry 默认 false
+
+    def test_industry_runs_when_enabled(self):
+        self._seed_quotes()
+        self.monitor._stock_service = FakeStockService()
+        self.monitor.config["monitor"]["refresh_industry"] = True
+        report = {"boards_total": 1, "boards_refreshed": ["BK0475"], "boards_failed": []}
+        with patch(
+            "ripple_tradePilot.data.market_service.MarketDataService.refresh_indexes",
+            return_value={"refreshed": [], "failed": []},
+        ), patch(
+            "ripple_tradePilot.data.industry_service.IndustryDataService.refresh_for_symbols",
+            return_value=report,
+        ) as mock_ind:
+            self.monitor._finalize_market_data("20260904", [{"code": SYMBOL}])
+        mock_ind.assert_called_once()
+        self.assertEqual(mock_ind.call_args[0][0], [SYMBOL])  # 股票池传入
 
 
 class BreakoutExemptionTest(_MonitorBase):

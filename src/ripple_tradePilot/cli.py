@@ -662,6 +662,98 @@ def audit(adjust, symbol, tol):
         )
 
 
+@data.command('refresh')
+@click.option('--market', is_flag=True, help='刷新指数日线（C1）+ 当日市场宽度（C2）')
+@click.option('--industry', is_flag=True, help='刷新股票池所属行业板块（成分股 + 日线，C3）')
+@click.option('--pool', type=click.Choice(['config', 'watchlist']), default='config',
+              help='--industry 的股票池来源：config.yaml symbols / Web 观察池')
+@click.option('--days', '-d', type=int, default=750, help='指数/板块历史深度（天）')
+def data_refresh(market, industry, pool, days):
+    """刷新市场/行业数据（C1-C3）。``--market`` 指数 + 宽度，``--industry`` 板块（按 ``--pool``）。
+
+    数据供给入口：指数/板块走各自降级链（部分成功 + 显式报告），市场宽度走"增量积累制"
+    （无免费历史宽度 API，每跑一天积一天，见 STRATEGIES.md C1/C2）。
+    """
+    if not market and not industry:
+        click.echo("请至少指定 --market 或 --industry", err=True)
+        sys.exit(2)
+
+    if market:
+        _refresh_market_data(days)
+    if industry:
+        _refresh_industry_data(pool, days)
+
+
+def _refresh_market_data(days: int) -> None:
+    """C1 指数日线 + C2 当日市场宽度（各自独立 try/except，单项失败不影响其他）。"""
+    from .data.market_service import MarketDataService, record_market_breadth
+    from .data.stock_service import StockDataService, StockDataUnavailableError
+    from .storage.database import load_stock_quotes
+
+    click.echo("\n📊 刷新市场数据（C1 指数日线 + C2 市场宽度）")
+    # C1：四大指数日线落库（三级降级链，部分成功）
+    try:
+        report = MarketDataService().refresh_indexes(days=days)
+        click.echo(
+            f"   指数日线：成功 {len(report['refreshed'])} 个 / 失败 {len(report['failed'])} 个"
+        )
+        for item in report['refreshed']:
+            click.echo(f"     ✓ {item['index_code']}（{item['source']}，{item['rows']} 行）")
+        for item in report['failed']:
+            click.echo(f"     ✗ {item['index_code']}：{item['error']}")
+    except Exception as error:  # 网络/接口异常一律降级，不阻断宽度刷新
+        click.echo(f"   ⚠️ 指数日线刷新异常：{error}")
+
+    # C2：当日全市场快照终态 → aggregate_breadth → market_daily
+    try:
+        StockDataService().refresh_quotes()
+    except StockDataUnavailableError as error:
+        click.echo(f"   ⚠️ 全市场快照刷新失败，用库内既有快照聚合宽度：{error}")
+    rows = load_stock_quotes()
+    if not rows:
+        click.echo("   ⚠️ 无全市场快照，跳过市场宽度聚合")
+        return
+    today = datetime.now().strftime("%Y%m%d")
+    breadth = record_market_breadth(today, rows, "snapshot")
+    click.echo(
+        f"   市场宽度（{today}）：上涨 {breadth['advancers']} / 下跌 {breadth['decliners']} / "
+        f"平盘 {breadth['unchanged']} / 涨停 {breadth['limit_up']} / 跌停 {breadth['limit_down']}"
+    )
+
+
+def _refresh_industry_data(pool: str, days: int) -> None:
+    """C3 行业板块刷新：解析股票池 → 只为所属板块拉成分股 + 日线（部分成功 + 报告）。"""
+    from .data.industry_service import IndustryDataService
+
+    if pool == 'watchlist':
+        from .storage.user_store import list_all_watched_symbols
+        symbols = [str(item['symbol']) for item in list_all_watched_symbols()
+                   if item.get('symbol')]
+    else:
+        cfg = load_config()
+        symbols = [str(s.get('code')) for s in cfg.get('symbols', []) if s.get('code')]
+
+    click.echo(f"\n🏭 刷新行业板块（C3，股票池 --pool {pool}，{len(symbols)} 只）")
+    if not symbols:
+        click.echo(f"   （--pool {pool} 无标的，跳过行业刷新）")
+        return
+
+    report = IndustryDataService().refresh_for_symbols(symbols, days=days)
+    click.echo(
+        f"   板块：目标 {report['boards_total']} 个 → "
+        f"成功 {len(report['boards_refreshed'])} / 失败 {len(report['boards_failed'])}"
+    )
+    click.echo(f"   成分股 {report['membership_rows']} 行，板块日线 {report['bar_rows']} 行")
+    unresolved = report['symbols_unresolved']
+    if unresolved:
+        preview = "、".join(unresolved[:5]) + ("…" if len(unresolved) > 5 else "")
+        click.echo(
+            f"   ⚠️ {len(unresolved)} 只无法映射到板块（行业特征将缺失，绝不造假）：{preview}"
+        )
+    for item in report['boards_failed']:
+        click.echo(f"     ✗ {item['board_name'] or item['board_code']}：{item['error']}")
+
+
 @cli.group()
 def signals():
     """信号台账（记录 → 回填前瞻收益 → 统计 coverage/胜率/期望）"""

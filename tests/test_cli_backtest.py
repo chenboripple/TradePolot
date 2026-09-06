@@ -19,7 +19,9 @@ from click.testing import CliRunner
 from ripple_tradePilot.cli import cli
 from ripple_tradePilot.storage.database import (
     init_database,
+    load_market_daily,
     upsert_daily_bars,
+    upsert_stock_quotes,
 )
 from ripple_tradePilot.storage.user_store import (
     get_backtest_run,
@@ -393,6 +395,106 @@ class CliDataAuditTest(_CliDbTestCase):
         # 只巡检 600000.SH（干净），不应报告 000001.SZ
         self.assertIn("未发现复权混接点", result.output)
         self.assertNotIn("000001.SZ", result.output)
+
+
+class CliDataRefreshTest(_CliDbTestCase):
+    """C4：``tradepilot data refresh --market/--industry``（mock 网络，离线）。"""
+
+    def _seed_quotes(self):
+        # 涨/跌/涨停混合，供 aggregate_breadth 聚合
+        upsert_stock_quotes(
+            [
+                {"symbol": "600000.SH", "price": 10.0, "change_pct": 9.85, "amount": 1e9},
+                {"symbol": "000001.SZ", "price": 12.0, "change_pct": -1.0, "amount": 2e9},
+                {"symbol": "300750.SZ", "price": 200.0, "change_pct": 19.9, "amount": 3e9},
+            ],
+            "synth",
+            self.db,
+        )
+
+    def test_no_flags_exits_2(self):
+        result = self.runner.invoke(cli, ["data", "refresh"])
+        self.assertEqual(result.exit_code, 2)
+        self.assertIn("请至少指定", result.output)
+
+    def test_market_writes_breadth_and_indexes(self):
+        self._seed_quotes()
+        index_report = {"refreshed": [{"index_code": "000300.SH", "source": "tushare", "rows": 5}],
+                        "failed": []}
+        with patch("ripple_tradePilot.data.market_service.MarketDataService.refresh_indexes",
+                   return_value=index_report) as mock_idx, \
+             patch("ripple_tradePilot.data.stock_service.StockDataService.refresh_quotes",
+                   return_value={"count": 0}):
+            result = self.runner.invoke(cli, ["data", "refresh", "--market"])
+        self.assertEqual(result.exit_code, 0, result.output)
+        mock_idx.assert_called_once()
+        self.assertIn("指数日线：成功 1 个", result.output)
+        self.assertIn("市场宽度", result.output)
+        # 宽度已落库（涨跌停分板块：600000 主板涨停 + 300750 创业板涨停 = 2）
+        rows = load_market_daily(self.db)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["limit_up"], 2)
+        self.assertEqual(rows[0]["advancers"], 2)
+        self.assertEqual(rows[0]["decliners"], 1)
+
+    def test_market_index_failure_does_not_block_breadth(self):
+        # 独立 try/except：指数刷新异常不应阻断宽度落库
+        self._seed_quotes()
+        with patch("ripple_tradePilot.data.market_service.MarketDataService.refresh_indexes",
+                   side_effect=RuntimeError("index down")), \
+             patch("ripple_tradePilot.data.stock_service.StockDataService.refresh_quotes",
+                   return_value={"count": 0}):
+            result = self.runner.invoke(cli, ["data", "refresh", "--market"])
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("指数日线刷新异常", result.output)
+        self.assertEqual(len(load_market_daily(self.db)), 1)  # 宽度仍写入
+
+    def test_industry_config_pool_calls_refresh_for_symbols(self):
+        report = {"boards_total": 1, "boards_refreshed": ["BK0475"], "boards_failed": [],
+                  "symbols_total": 1, "symbols_resolved": 1, "symbols_unresolved": [],
+                  "membership_rows": 3, "bar_rows": 5}
+        with patch("ripple_tradePilot.cli.load_config",
+                   return_value={"symbols": [{"code": "600000.SH", "name": "浦发"}]}), \
+             patch("ripple_tradePilot.data.industry_service.IndustryDataService.refresh_for_symbols",
+                   return_value=report) as mock_refresh:
+            result = self.runner.invoke(cli, ["data", "refresh", "--industry", "--pool", "config"])
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(mock_refresh.call_args[0][0], ["600000.SH"])  # 解析出的股票池
+        self.assertIn("板块：目标 1 个", result.output)
+        self.assertIn("成分股 3 行", result.output)
+
+    def test_industry_watchlist_pool(self):
+        report = {"boards_total": 1, "boards_refreshed": ["BK0475"], "boards_failed": [],
+                  "symbols_total": 1, "symbols_resolved": 1, "symbols_unresolved": [],
+                  "membership_rows": 2, "bar_rows": 4}
+        with patch("ripple_tradePilot.storage.user_store.list_all_watched_symbols",
+                   return_value=[{"symbol": "000001.SZ", "name": "平安"}]), \
+             patch("ripple_tradePilot.data.industry_service.IndustryDataService.refresh_for_symbols",
+                   return_value=report) as mock_refresh:
+            result = self.runner.invoke(cli, ["data", "refresh", "--industry", "--pool", "watchlist"])
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(mock_refresh.call_args[0][0], ["000001.SZ"])
+
+    def test_industry_empty_pool_skips(self):
+        # 默认 tmp config 无 symbols → config 池为空 → 跳过，不调用 refresh_for_symbols
+        with patch("ripple_tradePilot.data.industry_service.IndustryDataService.refresh_for_symbols") as mock_refresh:
+            result = self.runner.invoke(cli, ["data", "refresh", "--industry", "--pool", "config"])
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("无标的，跳过行业刷新", result.output)
+        mock_refresh.assert_not_called()
+
+    def test_industry_reports_unresolved_symbols(self):
+        report = {"boards_total": 1, "boards_refreshed": ["BK0475"], "boards_failed": [],
+                  "symbols_total": 2, "symbols_resolved": 1, "symbols_unresolved": ["999999.SH"],
+                  "membership_rows": 1, "bar_rows": 2}
+        with patch("ripple_tradePilot.cli.load_config",
+                   return_value={"symbols": [{"code": "600000.SH"}, {"code": "999999.SH"}]}), \
+             patch("ripple_tradePilot.data.industry_service.IndustryDataService.refresh_for_symbols",
+                   return_value=report):
+            result = self.runner.invoke(cli, ["data", "refresh", "--industry"])
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("无法映射到板块", result.output)
+        self.assertIn("999999.SH", result.output)
 
 
 if __name__ == "__main__":

@@ -11,13 +11,21 @@ from ripple_tradePilot.storage import database_path, init_database
 from ripple_tradePilot.storage.__main__ import main as initialize_storage
 from ripple_tradePilot.storage.database import (
     DATABASE_SCHEMA_VERSION,
+    industry_board_for_symbol,
     list_stock_catalog,
     load_daily_bars,
     load_index_bars,
+    load_industry_board_bars,
+    load_industry_boards,
+    load_industry_membership,
     load_market_daily,
     record_market_daily,
+    stock_catalog_industries,
     upsert_daily_bars,
     upsert_index_daily,
+    upsert_industry_board_bars,
+    upsert_industry_boards,
+    upsert_industry_membership,
     upsert_stock_catalog,
     upsert_stock_quotes,
 )
@@ -643,7 +651,7 @@ class SchemaV13MigrationTest(unittest.TestCase):
 
 
 class SchemaV14MigrationTest(unittest.TestCase):
-    """v14（C1 指数日线 + C2 市场宽度）迁移、幂等与读写往返。"""
+    """v14（C1 指数日线 + C2 市场宽度 + C3 行业三表）迁移、幂等与读写往返。"""
 
     INDEX_COLS = {
         "id", "index_code", "trade_date", "open", "high", "low", "close",
@@ -653,6 +661,12 @@ class SchemaV14MigrationTest(unittest.TestCase):
         "trade_date", "advancers", "decliners", "unchanged", "limit_up",
         "limit_down", "total_amount", "up_ratio", "source", "updated_at",
     }
+    BOARD_COLS = {"board_code", "board_name", "source", "updated_at"}
+    BOARD_BAR_COLS = {
+        "id", "board_code", "trade_date", "open", "high", "low", "close",
+        "pct_chg", "amount", "turnover_rate", "source", "updated_at",
+    }
+    MEMBERSHIP_COLS = {"board_code", "symbol", "as_of", "source", "updated_at"}
 
     def _tables(self, target):
         with sqlite3.connect(target) as connection:
@@ -681,6 +695,21 @@ class SchemaV14MigrationTest(unittest.TestCase):
             self.assertEqual(version, DATABASE_SCHEMA_VERSION)
             self.assertEqual(version, 14)
 
+    def test_fresh_db_has_industry_tables(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target = Path(temp_dir) / "fresh14ind.db"
+            init_database(target)
+            tables = self._tables(target)
+            for table in ("industry_boards", "industry_board_bars", "industry_membership"):
+                self.assertIn(table, tables)
+            self.assertTrue(self.BOARD_COLS.issubset(self._columns(target, "industry_boards")))
+            self.assertTrue(
+                self.BOARD_BAR_COLS.issubset(self._columns(target, "industry_board_bars"))
+            )
+            self.assertTrue(
+                self.MEMBERSHIP_COLS.issubset(self._columns(target, "industry_membership"))
+            )
+
     def test_legacy_v13_db_upgrades_to_v14(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             target = Path(temp_dir) / "legacy-v13.db"
@@ -688,14 +717,21 @@ class SchemaV14MigrationTest(unittest.TestCase):
             with sqlite3.connect(target) as connection:
                 connection.execute("DROP TABLE index_daily")
                 connection.execute("DROP TABLE market_daily")
+                connection.execute("DROP TABLE industry_boards")
+                connection.execute("DROP TABLE industry_board_bars")
+                connection.execute("DROP TABLE industry_membership")
                 connection.execute("PRAGMA user_version=13")
             self.assertNotIn("index_daily", self._tables(target))
+            self.assertNotIn("industry_boards", self._tables(target))
 
             init_database(target)  # 重新初始化应补建 v14 表
 
             tables = self._tables(target)
             self.assertIn("index_daily", tables)
             self.assertIn("market_daily", tables)
+            self.assertIn("industry_boards", tables)
+            self.assertIn("industry_board_bars", tables)
+            self.assertIn("industry_membership", tables)
             with sqlite3.connect(target) as connection:
                 version = connection.execute("PRAGMA user_version").fetchone()[0]
             self.assertEqual(version, 14)
@@ -705,8 +741,10 @@ class SchemaV14MigrationTest(unittest.TestCase):
             target = Path(temp_dir) / "idem14.db"
             init_database(target)
             init_database(target)  # 第二次不得抛错或重复建表
-            self.assertIn("index_daily", self._tables(target))
-            self.assertIn("market_daily", self._tables(target))
+            tables = self._tables(target)
+            self.assertIn("index_daily", tables)
+            self.assertIn("market_daily", tables)
+            self.assertIn("industry_membership", tables)
 
     def test_index_daily_unique_constraint_present(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -781,6 +819,75 @@ class SchemaV14MigrationTest(unittest.TestCase):
             # 日期闭区间过滤
             only_first = load_market_daily(target, start_date="20260102", end_date="20260102")
             self.assertEqual([r["trade_date"] for r in only_first], ["20260102"])
+
+    def test_industry_boards_upsert_and_load_round_trip(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target = Path(temp_dir) / "boards.db"
+            records = [
+                {"board_code": "BK0475", "board_name": "银行"},
+                {"board_code": "BK1027", "board_name": "小金属"},
+            ]
+            self.assertEqual(upsert_industry_boards(records, "em", target), 2)
+            # 幂等 + 覆盖名称
+            upsert_industry_boards([{"board_code": "BK0475", "board_name": "银行Ⅱ"}], "em", target)
+            boards = load_industry_boards(target)
+            self.assertEqual(len(boards), 2)  # 不产生重复行
+            self.assertEqual(boards[0]["board_code"], "BK0475")  # 升序
+            self.assertEqual(boards[0]["board_name"], "银行Ⅱ")
+
+    def test_industry_board_bars_unique_and_round_trip(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target = Path(temp_dir) / "boardbars.db"
+            rows = [
+                {"trade_date": "20260102", "open": 1000, "high": 1020, "low": 990,
+                 "close": 1015, "pct_chg": 1.5, "amount": 8e9, "turnover_rate": 1.1},
+                {"trade_date": "20260103", "open": 1015, "high": 1030, "low": 1010,
+                 "close": 1025, "pct_chg": 0.99, "amount": 7.5e9, "turnover_rate": 1.0},
+            ]
+            self.assertEqual(upsert_industry_board_bars("BK0475", rows, "em", target), 2)
+            # 幂等 + 覆盖：重写 20260103 的 close
+            upsert_industry_board_bars(
+                "BK0475", [{**rows[1], "close": 1099}], "em", target
+            )
+            loaded = load_industry_board_bars("BK0475", target)
+            self.assertEqual(len(loaded), 2)  # UNIQUE(board_code, trade_date) 不重复
+            self.assertEqual(loaded[1]["close"], 1099)
+            self.assertEqual(loaded[1]["turnover_rate"], 1.0)
+            # 不同板块互不干扰
+            self.assertEqual(load_industry_board_bars("BK1027", target), [])
+
+    def test_industry_membership_and_board_for_symbol(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target = Path(temp_dir) / "membership.db"
+            upsert_industry_membership("BK0475", ["600000.SH", "000001.SZ"], "20260102", "em", target)
+            members = load_industry_membership("BK0475", target)
+            self.assertEqual(len(members), 2)
+            self.assertEqual(members[0]["symbol"], "000001.SZ")  # 升序
+            self.assertEqual(members[0]["as_of"], "20260102")
+            # 重刷更新 as_of，不产生重复（PK(board_code, symbol)）
+            upsert_industry_membership("BK0475", ["600000.SH", "000001.SZ"], "20260103", "em", target)
+            self.assertEqual(len(load_industry_membership("BK0475", target)), 2)
+            self.assertEqual(load_industry_membership("BK0475", target)[0]["as_of"], "20260103")
+            # symbol → board 反查
+            self.assertEqual(industry_board_for_symbol("600000.SH", target), "BK0475")
+            self.assertIsNone(industry_board_for_symbol("999999.SH", target))
+            # 全表读取（无 board_code）
+            self.assertEqual(len(load_industry_membership(path=target)), 2)
+
+    def test_stock_catalog_industries_skips_empty(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target = Path(temp_dir) / "catalog.db"
+            upsert_stock_catalog(
+                [
+                    {"symbol": "600000.SH", "name": "浦发银行", "industry": "银行"},
+                    {"symbol": "000001.SZ", "name": "平安银行", "industry": "银行"},
+                    {"symbol": "600519.SH", "name": "贵州茅台", "industry": ""},  # 空 → 跳过
+                ],
+                "synth",
+                target,
+            )
+            industries = stock_catalog_industries(target)
+            self.assertEqual(industries, {"600000.SH": "银行", "000001.SZ": "银行"})
 
 
 if __name__ == "__main__":
