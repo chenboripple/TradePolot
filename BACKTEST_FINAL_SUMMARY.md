@@ -1,5 +1,8 @@
 # TradePilot 策略优化 - 最终总结
 
+
+> ⚠️ **可信度提示（2026-09 复核）**：本报告的高收益数字来自研究期脚本，存在前视撮合（当日收盘成交）、成本低估、参数在样本内寻优、窗口选择偏差等问题，**不可作为实盘预期**。统一口径回测（次日开盘撮合 + 涨跌停拦截 + 佣金/印花税/滑点 + 回撤闸门）请以 Web「回测记录」/ `tradepilot backtest` 与样本外验证为准。相关脚本已归档至 `experiments/`。
+
 **完成时间：** 2026-03-15 02:41
 
 ---
@@ -62,7 +65,7 @@ Bollinger: period=20, std_dev=2.0
 ## 📁 数据保存位置
 
 ```
-/Users/ripple/work space/ripple_tradePilot/
+/Users/ripple/work space/TradePilot/
 ├── data/backtest/
 │   ├── 002022_SZ_optimized_result.json    ✅ 002022 回测结果
 │   ├── 600309_SH_optimized_result.json    ✅ 600309 回测结果
@@ -71,7 +74,7 @@ Bollinger: period=20, std_dev=2.0
 │   └── backtest_results.db                ✅ SQLite 数据库
 ├── OPTIMIZATION_SUMMARY.md                ✅ 优化总结文档
 ├── FEISHU_FIX.md                          ⚠️ 飞书修复指南
-├── send_feishu_test.py                    ⚠️ 飞书测试脚本
+├── experiments/send_feishu_test.py                    ⚠️ 飞书测试脚本
 └── BACKTEST_FINAL_SUMMARY.md              ✅ 本文档
 ```
 
@@ -98,8 +101,8 @@ msg: sign match fail or timestamp is not within one hour from current time
 3. 关闭「签名校验」开关
 4. 保存后测试：
    ```bash
-   cd /Users/ripple/work\ space/ripple_tradePilot
-   python3 send_feishu_test.py
+   cd /Users/ripple/work\ space/TradePilot
+   PYTHONPATH=src python3 experiments/send_feishu_test.py
    ```
 
 **方案 2: 使用其他通知渠道**
@@ -150,7 +153,7 @@ msg: sign match fail or timestamp is not within one hour from current time
 ### 1. 修复飞书通知
 ```bash
 # 关闭签名校验后测试
-python3 send_feishu_test.py
+PYTHONPATH=src python3 experiments/send_feishu_test.py
 ```
 
 ### 2. 实盘测试
@@ -172,18 +175,18 @@ python3 send_feishu_test.py
 
 ### 查看回测结果
 ```bash
-cd /Users/ripple/work\ space/ripple_tradePilot
+cd /Users/ripple/work\ space/TradePilot
 cat data/backtest/002022_SZ_optimized_result.json | python3 -m json.tool
 ```
 
 ### 测试飞书
 ```bash
-python3 send_feishu_test.py
+PYTHONPATH=src python3 experiments/send_feishu_test.py
 ```
 
 ### 重新回测其他股票
 ```bash
-PYTHONPATH=src python3 run_backtest.py 600519.SH 贵州茅台 365
+PYTHONPATH=src python3 examples/run_backtest.py 600519.SH 贵州茅台 365
 ```
 
 ### 查看优化文档

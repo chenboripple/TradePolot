@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 import re
@@ -9,19 +10,24 @@ from typing import Any, Dict, Literal, Mapping, Optional
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from ripple_tradePilot import __version__
 from ripple_tradePilot.api.dashboard import DashboardDataError, DashboardService
 from ripple_tradePilot.backtest.engine import run_backtest
 from ripple_tradePilot.backtest.report import compute_metrics, compute_trade_stats
+from ripple_tradePilot.backtest.rules import MarketRules, price_limit_for_symbol
+from ripple_tradePilot.backtest.serialize import serialize_backtest_result
 from ripple_tradePilot.models.types import Bar
-from ripple_tradePilot.strategies.bollinger import BollingerBands
-from ripple_tradePilot.strategies.donchian import DonchianBreakout
-from ripple_tradePilot.strategies.macd import MACD
-from ripple_tradePilot.strategies.moving_average import MovingAverageCross
-from ripple_tradePilot.strategies.rsi import RSI
-from ripple_tradePilot.config_loader import get_tushare_token, load_config
+from ripple_tradePilot.config_loader import get_tushare_token, get_vote_threshold, load_config
+from ripple_tradePilot.signals.backtest_profile import (
+    BACKTEST_STRATEGIES,
+    PARAM_WHITELIST,
+    IllegalParamError,
+    UnknownProfileError,
+    params_schema,
+    resolve_backtest_strategy,
+)
 from ripple_tradePilot.data.stock_service import (
     InvalidStockSymbolError,
     StockDataService,
@@ -50,9 +56,10 @@ from ripple_tradePilot.storage.user_store import (
     delete_session,
     delete_user_backtest,
     ensure_system_strategies,
+    get_user_backtest,
     list_user_backtests,
     list_user_stocks,
-    record_user_backtest,
+    record_backtest_run,
     list_visible_strategies,
     list_user_watchlist,
     set_watchlist_default_strategy,
@@ -497,6 +504,25 @@ def delete_backtest(backtest_id: int, user: Dict = Depends(required_user)):
         raise HTTPException(status_code=404, detail=str(error)) from error
 
 
+@app.get("/api/backtests/{backtest_id}")
+def backtest_detail(backtest_id: int, user: Dict = Depends(required_user)):
+    """取单条回测记录的完整结果，供前端历史回放。
+
+    记录不存在或属于他人 → 404；旧记录未保存明细 → 409（前端提示无法回放）。
+    """
+    record = get_user_backtest(backtest_id, user["id"])
+    if record is None:
+        raise HTTPException(status_code=404, detail="回测记录不存在或无权查看")
+    raw = record.get("result_json")
+    if not raw:
+        raise HTTPException(status_code=409, detail="该记录未保存权益曲线与成交明细，无法回放（请重跑）")
+    try:
+        data = json.loads(raw)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=409, detail="回测明细解析失败，请重跑")
+    return {"data": data}
+
+
 @app.get("/api/watchlist")
 def watchlist(user: Dict = Depends(required_user)):
     return {"items": list_user_watchlist(user["id"])}
@@ -740,23 +766,129 @@ def market_overview(user: Dict = Depends(required_user)):
         raise _stock_error(error) from error
 
 
+_BACKTEST_DEFAULT_STRATEGY = "rsi"
+_BACKTEST_DEFAULT_EXECUTION = "next_open"
+
+
+class BacktestParams(BaseModel):
+    """回测参数（A5，全 Optional）：按 ``strategy`` 白名单校验，越界键 → 422。
+
+    单策略用类构造器形参名（fast/slow/period/oversold/overbought/std_dev/signal/window）；
+    combo_vote 用扁平三件套键（ma_fast/…/bb_std）+ vote_threshold(1~3)。同名字段（如 period）
+    被多个单策略复用，白名单按 strategy 区分。Field 约束做值域预校验，构造器/parse_profile
+    做最终合法性校验（非法值在端点转 422）。
+    """
+
+    # 单策略 canonical 形参名
+    fast: Optional[int] = Field(None, ge=1)
+    slow: Optional[int] = Field(None, ge=2)
+    period: Optional[int] = Field(None, ge=2)
+    oversold: Optional[float] = None
+    overbought: Optional[float] = None
+    std_dev: Optional[float] = Field(None, gt=0)
+    signal: Optional[int] = Field(None, ge=1)
+    window: Optional[int] = Field(None, ge=2)
+    # combo_vote 扁平三件套键
+    ma_fast: Optional[int] = Field(None, ge=1)
+    ma_slow: Optional[int] = Field(None, ge=2)
+    rsi_period: Optional[int] = Field(None, ge=2)
+    rsi_oversold: Optional[float] = None
+    rsi_overbought: Optional[float] = None
+    bb_period: Optional[int] = Field(None, ge=2)
+    bb_std: Optional[float] = Field(None, gt=0)
+    vote_threshold: Optional[int] = Field(None, ge=1, le=3)
+
+
 class BacktestRequest(BaseModel):
     symbol: str
-    strategy: Literal["ma", "rsi", "macd", "bollinger", "donchian"] = "rsi"
+    strategy: Literal["ma", "rsi", "macd", "bollinger", "donchian", "combo_vote"] = _BACKTEST_DEFAULT_STRATEGY
     bars: int = Field(252, ge=60, le=2500)
     cash: float = Field(100000.0, gt=0)
-    execution: Literal["next_open", "close"] = "next_open"
+    execution: Literal["next_open", "close"] = _BACKTEST_DEFAULT_EXECUTION
     # 基准对比默认关：保持默认回测快、离线可测
     benchmark: bool = False
+    # A5：显式参数 + 画像选择（"system" | config 画像名 | None）；解析优先级见
+    # signals.backtest_profile.resolve_backtest_strategy（params > profile > 缺省链）
+    params: Optional[BacktestParams] = None
+    profile: Optional[str] = None
+
+    @model_validator(mode="after")
+    def _validate_params_whitelist(self) -> "BacktestRequest":
+        """params 的键必须落在该 strategy 的白名单内，否则 422（pydantic ValidationError）。"""
+        if self.params is None:
+            return self
+        clean = self.params.model_dump(exclude_none=True)
+        if not clean:
+            return self
+        allowed = PARAM_WHITELIST.get(self.strategy, frozenset())
+        illegal = sorted(key for key in clean if key not in allowed)
+        if illegal:
+            raise ValueError(
+                f"策略 {self.strategy!r} 不接受参数 {', '.join(illegal)}；"
+                f"可用参数：{', '.join(sorted(allowed)) or '（无）'}"
+            )
+        return self
 
 
-_BACKTEST_STRATEGIES = {
-    "ma": MovingAverageCross,
-    "rsi": RSI,
-    "macd": MACD,
-    "bollinger": BollingerBands,
-    "donchian": DonchianBreakout,
+# 策略/撮合模式中文名：单一来源，经 /api/meta/backtest-options 下发，
+# 前端下拉与回测结果标题都以此为准（此前 index.html 与 app.js 各写一份，已漂移）。
+# 策略键集与 signals.backtest_profile.BACKTEST_STRATEGIES 一致（四方一致性测试钉死）。
+_BACKTEST_STRATEGY_LABELS = {
+    "ma": "均线交叉 (MA)",
+    "rsi": "RSI 反转",
+    "macd": "MACD 趋势",
+    "bollinger": "布林带",
+    "donchian": "唐奇安通道",
+    "combo_vote": "组合投票 (combo_vote)",
 }
+
+_BACKTEST_EXECUTION_LABELS = {
+    "next_open": "次日开盘撮合",
+    "close": "当日收盘撮合",
+}
+
+
+def _backtest_profile_options() -> list:
+    """profile 下拉选项：``system``（按标的的系统策略）+ config.strategy_profiles 画像名。
+
+    离线 / 无 config 时只返回 system 项，绝不抛错（meta 是公开端点）。
+    """
+    options = [{"value": "system", "label": "系统策略（按标的）"}]
+    try:
+        profiles = load_config().get("strategy_profiles") or {}
+    except Exception:
+        profiles = {}
+    for name in sorted(profiles):
+        options.append({"value": name, "label": f"配置画像：{name}"})
+    return options
+
+
+@app.get("/api/meta/backtest-options")
+def backtest_options():
+    """回测表单元数据（公开）：策略注册表 / 标签 / 参数 schema 单一来源，前端自动跟随。
+
+    ``strategies[].params_schema`` 由 ``signals.backtest_profile.params_schema()`` 生成
+    （单策略 default 取自类构造器 ``inspect.signature``，combo_vote 取自 profile.py 常量），
+    前端据此动态渲染参数输入；``profiles`` 为画像下拉（system + config 画像名）。
+    """
+    schema = params_schema()
+    return {
+        "strategies": [
+            {
+                "value": key,
+                "label": _BACKTEST_STRATEGY_LABELS[key],
+                "params_schema": schema.get(key, []),
+            }
+            for key in BACKTEST_STRATEGIES
+        ],
+        "default_strategy": _BACKTEST_DEFAULT_STRATEGY,
+        "executions": [
+            {"value": key, "label": label}
+            for key, label in _BACKTEST_EXECUTION_LABELS.items()
+        ],
+        "default_execution": _BACKTEST_DEFAULT_EXECUTION,
+        "profiles": _backtest_profile_options(),
+    }
 
 _BENCHMARK_CODE = "000300.SH"
 _BENCHMARK_NAME = "沪深300"
@@ -836,6 +968,19 @@ def run_web_backtest(payload: BacktestRequest, user: Dict = Depends(required_use
     """统一引擎回测：次日开盘撮合、涨跌停拦截、100 股整数倍、佣金+印花税+滑点。"""
     try:
         symbol = StockDataService.normalize_symbol(payload.symbol)
+        # A5：解析回测策略（params > profile > 缺省链）+ provenance；非法参数/画像名 → 422
+        config = load_config()
+        try:
+            resolved = resolve_backtest_strategy(
+                symbol=symbol,
+                strategy=payload.strategy,
+                params=payload.params.model_dump(exclude_none=True) if payload.params else None,
+                profile=payload.profile,
+                config=config,
+                default_threshold=get_vote_threshold(config),
+            )
+        except (IllegalParamError, UnknownProfileError, ValueError) as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
         rows = load_daily_bars(symbol)
         if len(rows) < payload.bars:
             # 本地日线不足时先刷新行情再回测
@@ -863,17 +1008,33 @@ def run_web_backtest(payload: BacktestRequest, user: Dict = Depends(required_use
             )
 
         result = run_backtest(
-            strategy=_BACKTEST_STRATEGIES[payload.strategy](),
+            strategy=resolved.strategy,
             bars=bars,
             initial_cash=payload.cash,
             execution=payload.execution,
+            market_rules=MarketRules(price_limit_pct=price_limit_for_symbol(symbol)),
         )
-        metrics = compute_metrics(result.equity_curve)
+        metrics = compute_metrics(result.equity_curve, positions=result.positions)
         stats = compute_trade_stats(result.fills)
-        # 落库到回测记录页；记录失败不影响本次回测结果返回
+        data = serialize_backtest_result(
+            symbol=symbol,
+            strategy_key=resolved.strategy_key,
+            execution=payload.execution,
+            bars=bars,
+            result=result,
+            metrics=metrics,
+            stats=stats,
+            # 基准对比按需附加：仅 benchmark=true 时返回该字段，取不到则优雅降级
+            benchmark=_benchmark_payload(bars) if payload.benchmark else None,
+            # A5 provenance：来源 + 实际生效参数，进响应供前端结果卡片显示
+            profile_source=resolved.profile_source,
+            strategy_params=resolved.strategy_params,
+        )
+        # 落库到回测记录页（含完整结果，供历史回放）；记录失败不影响本次回测返回。
+        # A5：改走 record_backtest_run（带 user_id），与 CLI 同表同格式，并写入 v12 溯源列
+        # （run_kind/params_json/profile_source）——Web 回测的 provenance 由此可查。
         try:
-            record_user_backtest(
-                user["id"],
+            record_backtest_run(
                 {
                     "symbol": symbol,
                     "name": stock_catalog_name(symbol) or symbol,
@@ -889,54 +1050,29 @@ def run_web_backtest(payload: BacktestRequest, user: Dict = Depends(required_use
                     "sharpe_ratio": metrics.sharpe,
                     "total_trades": stats.num_trades,
                     "win_rate": (stats.win_rate or 0.0) * 100,
-                    "strategy_key": payload.strategy,
+                    "strategy_key": resolved.strategy_key,
                     "bar_count": len(bars),
                     "execution": payload.execution,
+                    "result_json": json.dumps(data, ensure_ascii=False),
                 },
+                user_id=user["id"],
+                run_kind="backtest",
+                params_json=json.dumps(
+                    {
+                        "symbol": symbol,
+                        "strategy": resolved.strategy_key,
+                        "bars": payload.bars,
+                        "cash": payload.cash,
+                        "execution": payload.execution,
+                        "profile": payload.profile,
+                        "params": resolved.strategy_params,
+                    },
+                    ensure_ascii=False,
+                ),
+                profile_source=resolved.profile_source,
             )
         except Exception:
             logger.warning("回测结果落库失败：%s", symbol, exc_info=True)
-        data = {
-            "symbol": symbol,
-            "strategy": payload.strategy,
-            "execution": payload.execution,
-            "bar_count": len(bars),
-            "metrics": {
-                "total_return": metrics.total_return,
-                "annual_return": metrics.annual_return,
-                "max_drawdown": metrics.max_drawdown,
-                "sharpe": metrics.sharpe,
-            },
-            "trades": {
-                "num_trades": stats.num_trades,
-                "win_rate": stats.win_rate,
-                "avg_return_per_trade": stats.avg_return_per_trade,
-                "best_trade": stats.best_trade,
-                "worst_trade": stats.worst_trade,
-                "total_fees": stats.total_fees,
-            },
-            "halted_by_drawdown": result.halted_by_drawdown,
-            "skipped_fills": len(result.skipped_fills),
-            "equity_curve": [
-                {"date": bars[index].timestamp.strftime("%Y-%m-%d"), "equity": value}
-                for index, value in enumerate(result.equity_curve)
-                if index < len(bars)
-            ],
-            "fills": [
-                {
-                    "date": fill.timestamp.strftime("%Y-%m-%d"),
-                    "side": fill.side.value,
-                    "quantity": fill.quantity,
-                    "price": fill.price,
-                    "fee": fill.fee,
-                }
-                for fill in result.fills
-            ],
-            "disclaimer": "样本内回测仅供参考，未经样本外验证的收益不可作为预期收益。",
-        }
-        # 基准对比按需附加：仅 benchmark=true 时返回该字段，取不到则优雅降级
-        if payload.benchmark:
-            data["benchmark"] = _benchmark_payload(bars)
         return {"data": data}
     except (InvalidStockSymbolError, StockDataUnavailableError) as error:
         raise _stock_error(error) from error

@@ -115,9 +115,12 @@ tushare:
   cache_dir: "data/cache"
   rate_limit_delay: 1.5
 
-feishu:
-  webhook_url: "https://open.feishu.cn/..."
-  webhook_secret: "your_secret"
+# 飞书通知（配好 webhook 即生效；旧的顶层 feishu.webhook_url 结构仍兼容）
+notifiers:
+  feishu:
+    enabled: true
+    webhook: "https://open.feishu.cn/..."
+    secret: "your_secret"
 
 monitor:
   interval_seconds: 300

@@ -7,18 +7,51 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
-from ripple_tradePilot.config_loader import load_config
-from ripple_tradePilot.indicators import (
-    DEFAULT_VOTE_THRESHOLD,
-    bollinger,
-    rolling_mean,
-    rsi_series,
+from ripple_tradePilot.config_loader import get_vote_threshold, load_config
+from ripple_tradePilot.signals import (
+    REC_BUY,
+    REC_CONFLICT,
+    REC_HOLD,
+    REC_SELL,
+    ProfileSpec,
+    evaluate_symbol,
 )
 from ripple_tradePilot.storage.user_store import get_system_strategy
 
 
 class DashboardDataError(RuntimeError):
     pass
+
+
+def _flat_parameters(spec: ProfileSpec) -> Dict[str, Any]:
+    """ProfileSpec → 前端消费的扁平参数字典（三件套口径，缺省回退默认值）。"""
+    summary = spec.params_summary()
+    ma = summary.get("ma", {})
+    rsi = summary.get("rsi", {})
+    bb = summary.get("bollinger", {})
+    return {
+        "ma_fast": ma.get("fast", 5),
+        "ma_slow": ma.get("slow", 20),
+        "rsi_period": rsi.get("period", 14),
+        "rsi_oversold": rsi.get("oversold", 30),
+        "rsi_overbought": rsi.get("overbought", 70),
+        "bb_period": bb.get("period", 20),
+        "bb_std": bb.get("num_std", 2.0),
+        "vote_threshold": spec.vote_threshold,
+    }
+
+
+def _component_detail(decision, kind: str, key: str) -> Optional[float]:
+    """从某个决策里取指定类型组件的指标值（图表叠加线与指标面板用）。"""
+    for component in decision.components:
+        if component.kind == kind:
+            return component.detail.get(key)
+    return None
+
+
+def _vote_ratio_pct(decision) -> int:
+    """规则票占比（0-100 整数）。取代旧 confidence——这是投票占比，不是概率。"""
+    return round(decision.vote_ratio * 100)
 
 
 class DashboardService:
@@ -171,75 +204,6 @@ class DashboardService:
             )
         return bars
 
-    @staticmethod
-    def _profile_parameters(profile: Dict[str, Any]) -> Dict[str, Any]:
-        ma_config = profile.get("ma", {})
-        rsi_config = profile.get("rsi", {})
-        bb_config = profile.get("bb", {})
-        return {
-            "ma_fast": int(profile.get("ma_fast", ma_config.get("fast", 5))),
-            "ma_slow": int(profile.get("ma_slow", ma_config.get("slow", 20))),
-            "rsi_period": int(profile.get("rsi_period", rsi_config.get("period", 14))),
-            "rsi_oversold": float(profile.get("rsi_oversold", rsi_config.get("oversold", 30))),
-            "rsi_overbought": float(profile.get("rsi_overbought", rsi_config.get("overbought", 70))),
-            "bb_period": int(profile.get("bb_period", bb_config.get("period", 20))),
-            "bb_std": float(profile.get("bb_std", bb_config.get("std_dev", 2.0))),
-            "vote_threshold": int(profile.get("vote_threshold", DEFAULT_VOTE_THRESHOLD)),
-        }
-
-    @staticmethod
-    def _decision(
-        close: float,
-        fast_ma: Optional[float],
-        slow_ma: Optional[float],
-        rsi: Optional[float],
-        upper: Optional[float],
-        lower: Optional[float],
-        parameters: Dict[str, Any],
-    ) -> Dict[str, Any]:
-        votes = {"ma": "HOLD", "rsi": "HOLD", "bollinger": "HOLD"}
-        if fast_ma is not None and slow_ma is not None:
-            votes["ma"] = "BUY" if fast_ma > slow_ma else "SELL"
-        if rsi is not None:
-            if rsi <= parameters["rsi_oversold"]:
-                votes["rsi"] = "BUY"
-            elif rsi >= parameters["rsi_overbought"]:
-                votes["rsi"] = "SELL"
-        if upper is not None and lower is not None:
-            if close <= lower:
-                votes["bollinger"] = "BUY"
-            elif close >= upper:
-                votes["bollinger"] = "SELL"
-
-        buy_count = sum(value == "BUY" for value in votes.values())
-        sell_count = sum(value == "SELL" for value in votes.values())
-        threshold = parameters["vote_threshold"]
-        if buy_count >= threshold and buy_count > sell_count:
-            recommendation = "BUY"
-        elif sell_count >= threshold and sell_count > buy_count:
-            recommendation = "SELL"
-        else:
-            recommendation = "HOLD"
-
-        reasons = []
-        if votes["ma"] != "HOLD":
-            reasons.append(f"短期均线{'高于' if votes['ma'] == 'BUY' else '低于'}长期均线")
-        if votes["rsi"] != "HOLD" and rsi is not None:
-            reasons.append(f"RSI {rsi:.1f} 进入{'超卖' if votes['rsi'] == 'BUY' else '超买'}区")
-        if votes["bollinger"] != "HOLD":
-            reasons.append(f"价格触及布林带{'下轨' if votes['bollinger'] == 'BUY' else '上轨'}")
-        if not reasons:
-            reasons.append("指标未形成一致方向")
-
-        return {
-            "recommendation": recommendation,
-            "buy_count": buy_count,
-            "sell_count": sell_count,
-            "confidence": round(max(buy_count, sell_count) / len(votes) * 100),
-            "votes": votes,
-            "reason": "；".join(reasons),
-        }
-
     def market_detail(
         self,
         symbol_code: str,
@@ -283,39 +247,35 @@ class DashboardService:
             or (system_strategy["profile"] if system_strategy is not None else None)
             or symbol.get("strategy_profile", "未配置")
         )
-        parameters = self._profile_parameters(profile)
-        closes = [bar["close"] for bar in bars]
-        fast_ma = rolling_mean(closes, parameters["ma_fast"])
-        slow_ma = rolling_mean(closes, parameters["ma_slow"])
-        rsi_values = rsi_series(closes, parameters["rsi_period"])
-        bb_middle, bb_upper, bb_lower = bollinger(
-            closes, parameters["bb_period"], parameters["bb_std"]
+        # 统一投票口径：dashboard / monitor / 回测共用 signals.evaluate_symbol（A1 单一真源）。
+        if profile_override is not None:
+            profile_source = "explicit"
+        elif default_parameters is not None:
+            profile_source = "default_strategy"
+        elif system_strategy is not None:
+            profile_source = "system"
+        else:
+            profile_source = "config"
+        evaluation = evaluate_symbol(
+            bars,
+            profile,
+            default_threshold=get_vote_threshold(self._config()),
+            source=profile_source,
         )
+        spec = evaluation.spec
+        parameters = _flat_parameters(spec)
+        decisions = evaluation.decisions
 
-        decisions: List[Dict[str, Any]] = []
-        signals: List[Dict[str, Any]] = []
-        previous_recommendation = "HOLD"
-        for index, bar in enumerate(bars):
-            decision = self._decision(
-                bar["close"],
-                fast_ma[index],
-                slow_ma[index],
-                rsi_values[index],
-                bb_upper[index],
-                bb_lower[index],
-                parameters,
-            )
-            decisions.append(decision)
-            if decision["recommendation"] in {"BUY", "SELL"} and decision["recommendation"] != previous_recommendation:
-                signals.append(
-                    {
-                        "date": bar["timestamp"].date().isoformat(),
-                        "side": decision["recommendation"],
-                        "price": bar["close"],
-                        "reason": decision["reason"],
-                    }
-                )
-            previous_recommendation = decision["recommendation"]
+        # 信号列表 = 决策转移点（进入 BUY/SELL 的边沿事件），与回测/监控同源
+        signals: List[Dict[str, Any]] = [
+            {
+                "date": bars[event.index]["timestamp"].date().isoformat(),
+                "side": event.side.value,
+                "price": bars[event.index]["close"],
+                "reason": event.decision.reason,
+            }
+            for event in evaluation.events
+        ]
 
         latest = bars[-1]
         previous = bars[-2] if len(bars) > 1 else latest
@@ -326,6 +286,7 @@ class DashboardService:
         chart_bars = []
         for index in range(start, len(bars)):
             bar = bars[index]
+            decision = decisions[index]
             chart_bars.append(
                 {
                     "date": bar["timestamp"].date().isoformat(),
@@ -334,11 +295,11 @@ class DashboardService:
                     "low": bar["low"],
                     "close": bar["close"],
                     "volume": bar["volume"],
-                    "ma_fast": fast_ma[index],
-                    "ma_slow": slow_ma[index],
-                    "bb_upper": bb_upper[index],
-                    "bb_middle": bb_middle[index],
-                    "bb_lower": bb_lower[index],
+                    "ma_fast": _component_detail(decision, "ma", "fast_ma"),
+                    "ma_slow": _component_detail(decision, "ma", "slow_ma"),
+                    "bb_upper": _component_detail(decision, "bollinger", "upper"),
+                    "bb_middle": _component_detail(decision, "bollinger", "middle"),
+                    "bb_lower": _component_detail(decision, "bollinger", "lower"),
                 }
             )
 
@@ -354,9 +315,8 @@ class DashboardService:
                 else symbol.get("strategy_profile", "未配置")
             ),
             "default_strategy_id": symbol.get("default_strategy_id"),
-            "profile_kind": profile.get(
-                "kind", "combo_vote" if effective_override is not None else "unknown"
-            ),
+            "profile_kind": spec.kind if effective_override is not None or profile else "unknown",
+            "profile_source": profile_source,
             "parameters": parameters,
             "price": latest["close"],
             "change": latest["close"] - previous["close"],
@@ -364,19 +324,22 @@ class DashboardService:
             "latest_date": latest["timestamp"].date().isoformat(),
             "freshness": "fresh" if lag_days <= 4 else "stale",
             "lag_days": lag_days,
-            "recommendation": latest_decision["recommendation"],
-            "confidence": latest_decision["confidence"],
-            "buy_count": latest_decision["buy_count"],
-            "sell_count": latest_decision["sell_count"],
-            "votes": latest_decision["votes"],
-            "reason": latest_decision["reason"],
+            "recommendation": latest_decision.recommendation,
+            # vote_ratio：规则票占比（0-100），取代旧 confidence 伪概率——它不是概率
+            "vote_ratio": _vote_ratio_pct(latest_decision),
+            "is_conflict": latest_decision.is_conflict,
+            "buy_count": latest_decision.buy_count,
+            "sell_count": latest_decision.sell_count,
+            "vote_threshold": latest_decision.vote_threshold,
+            "votes": latest_decision.votes,
+            "reason": latest_decision.reason,
             "indicators": {
-                "ma_fast": fast_ma[-1],
-                "ma_slow": slow_ma[-1],
-                "rsi": rsi_values[-1],
-                "bb_upper": bb_upper[-1],
-                "bb_middle": bb_middle[-1],
-                "bb_lower": bb_lower[-1],
+                "ma_fast": _component_detail(latest_decision, "ma", "fast_ma"),
+                "ma_slow": _component_detail(latest_decision, "ma", "slow_ma"),
+                "rsi": _component_detail(latest_decision, "rsi", "rsi"),
+                "bb_upper": _component_detail(latest_decision, "bollinger", "upper"),
+                "bb_middle": _component_detail(latest_decision, "bollinger", "middle"),
+                "bb_lower": _component_detail(latest_decision, "bollinger", "lower"),
             },
             "bars": chart_bars,
             "signals": signals[-8:][::-1],
@@ -404,7 +367,8 @@ class DashboardService:
                     "kind": item["profile_kind"],
                     "parameters": item["parameters"],
                     "recommendation": item["recommendation"],
-                    "confidence": item["confidence"],
+                    "vote_ratio": item["vote_ratio"],
+                    "is_conflict": item["is_conflict"],
                     "visibility": "public",
                     "owner": str(
                         symbol.get("strategy_owner") or configured_owner
@@ -431,18 +395,29 @@ class DashboardService:
                     }
                 )
 
+        # CONFLICT 是统一口径新增的第四态（组件多空分歧/票数不足），单列计数，
+        # 不再被静默并入 HOLD——buy+sell+hold+conflict == symbols 恒成立。
         recommendation_counts = {
             side: sum(item["recommendation"] == side for item in details)
-            for side in ("BUY", "SELL", "HOLD")
+            for side in (REC_BUY, REC_SELL, REC_HOLD, REC_CONFLICT)
         }
         latest_date = max((item["latest_date"] for item in details), default=None)
+
+        def _asset_count(asset_class: str, recommendation: str) -> int:
+            return sum(
+                item["asset_class"] == asset_class
+                and item["recommendation"] == recommendation
+                for item in details
+            )
+
         asset_counts = {
             asset_class: {
                 "configured": sum(item.get("asset_class") == asset_class for item in self._symbols()),
                 "available": sum(item["asset_class"] == asset_class for item in details),
-                "buy": sum(item["asset_class"] == asset_class and item["recommendation"] == "BUY" for item in details),
-                "sell": sum(item["asset_class"] == asset_class and item["recommendation"] == "SELL" for item in details),
-                "hold": sum(item["asset_class"] == asset_class and item["recommendation"] == "HOLD" for item in details),
+                "buy": _asset_count(asset_class, REC_BUY),
+                "sell": _asset_count(asset_class, REC_SELL),
+                "hold": _asset_count(asset_class, REC_HOLD),
+                "conflict": _asset_count(asset_class, REC_CONFLICT),
             }
             for asset_class in ("stock", "future")
         }
@@ -450,9 +425,10 @@ class DashboardService:
             "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
             "summary": {
                 "symbols": len(details),
-                "buy": recommendation_counts["BUY"],
-                "sell": recommendation_counts["SELL"],
-                "hold": recommendation_counts["HOLD"],
+                "buy": recommendation_counts[REC_BUY],
+                "sell": recommendation_counts[REC_SELL],
+                "hold": recommendation_counts[REC_HOLD],
+                "conflict": recommendation_counts[REC_CONFLICT],
                 "stale": sum(item["freshness"] == "stale" for item in details),
                 "latest_date": latest_date,
                 "by_asset": asset_counts,

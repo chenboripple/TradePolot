@@ -14,6 +14,7 @@ import httpx
 import pandas as pd
 
 from ripple_tradePilot.config_loader import load_config
+from ripple_tradePilot.data.adjustment import detect_rebase
 from ripple_tradePilot.data.tushare_loader import TushareDataLoader
 from ripple_tradePilot.storage.database import (
     database_path,
@@ -763,53 +764,108 @@ class StockDataService:
         )
         return frame
 
+    def _fetch_daily(
+        self, symbol: str, start_date: str, end_date: str
+    ) -> Tuple[pd.DataFrame, str]:
+        """tushare → akshare 降级拉取并规范化、做价格合理性校验。
+
+        返回 ``(frame, source)``；frame 为空表示两源都无有效数据。
+        """
+        frame = pd.DataFrame()
+        source = "tushare"
+        try:
+            frame = self._fetch_tushare(symbol, start_date, end_date)
+        except Exception:
+            frame = pd.DataFrame()
+        if len(frame) == 0:
+            source = "akshare"
+            try:
+                frame = self._fetch_akshare(symbol, start_date, end_date)
+            except Exception as error:
+                raise StockDataUnavailableError(
+                    f"无法获取 {symbol} 的日线数据，请检查行情源配置"
+                ) from error
+        fetched = self._normalize_frame(frame)
+        if len(fetched):
+            # 价格合理性校验：丢弃非正价/高低倒置的脏行
+            fetched = fetched[
+                (fetched[["open", "high", "low", "close"]] > 0).all(axis=1)
+                & (fetched["high"] >= fetched["low"])
+            ].reset_index(drop=True)
+        return fetched, source
+
     def refresh(self, value: str, initial_days: int = 365) -> Dict[str, Any]:
         symbol = self.normalize_symbol(value)
         now = datetime.now()
+        config = load_config(str(self.config_path))
+        data_cfg = config.get("data", {}) if isinstance(config, dict) else {}
+        # A9：回看窗口 10→可配置（默认 30），给复权检测留足重叠样本
+        overlap_days = int(data_cfg.get("refresh_overlap_days", 30))
+        full_refetch_days = int(data_cfg.get("full_refetch_days", 1095))
         with _DATA_LOCK:
             existing = pd.DataFrame(load_daily_bars(symbol, self.database))
             if len(existing):
                 existing = self._normalize_frame(existing)
             if len(existing):
                 latest = datetime.strptime(existing.iloc[-1]["trade_date"], "%Y%m%d")
-                start = latest - timedelta(days=10)
+                start = latest - timedelta(days=overlap_days)
             else:
                 start = now - timedelta(days=initial_days)
             start_date = start.strftime("%Y%m%d")
             end_date = now.strftime("%Y%m%d")
 
-            frame = pd.DataFrame()
             name = stock_catalog_name(symbol, self.database) or self._configured_name(
                 symbol
             )
-            source = "tushare"
-            try:
-                frame = self._fetch_tushare(symbol, start_date, end_date)
-            except Exception:
-                frame = pd.DataFrame()
-            if len(frame) == 0:
-                source = "akshare"
-                try:
-                    frame = self._fetch_akshare(symbol, start_date, end_date)
-                except Exception as error:
-                    raise StockDataUnavailableError(
-                        f"无法获取 {symbol} 的日线数据，请检查行情源配置"
-                    ) from error
-            fetched = self._normalize_frame(frame)
-            if len(fetched):
-                # 价格合理性校验：丢弃非正价/高低倒置的脏行
-                fetched = fetched[
-                    (fetched[["open", "high", "low", "close"]] > 0).all(axis=1)
-                    & (fetched["high"] >= fetched["low"])
-                ].reset_index(drop=True)
+
+            fetched, source = self._fetch_daily(symbol, start_date, end_date)
             if len(fetched) == 0:
                 raise StockDataUnavailableError(f"未获取到 {symbol} 的有效日线数据")
-            merged = self._normalize_frame(pd.concat([existing, fetched], ignore_index=True))
+
+            # A9 复权基准漂移检测：库内存量 vs 新拉取的重叠日 close 比值。
+            # 命中（连续≥2日方向一致、幅度恒定的乘法偏差）→ 判上游 qfq 重算，
+            # 全量重拉整段覆盖，杜绝新旧复权基准混接。
+            stored_rows = existing.to_dict(orient="records") if len(existing) else []
+            rebase_report = detect_rebase(stored_rows, fetched.to_dict(orient="records"))
+            rebased = rebase_report.rebased
+            if rebased:
+                # 扩窗覆盖全部存量历史（含 initial_days/full_refetch_days/实际跨度），
+                # 确保旧锚行全部被新锚数据覆盖，不在更早处残留混接点。
+                span_days = 0
+                if len(existing):
+                    earliest = datetime.strptime(
+                        existing.iloc[0]["trade_date"], "%Y%m%d"
+                    )
+                    span_days = (now - earliest).days
+                refetch_days = max(initial_days, full_refetch_days, span_days)
+                full_start = (now - timedelta(days=refetch_days)).strftime("%Y%m%d")
+                logger.warning(
+                    "检测到 %s 复权基准漂移（factor≈%.4f，连续 %d 日）：全量重拉 %s~%s",
+                    symbol,
+                    rebase_report.factor,
+                    rebase_report.max_run,
+                    full_start,
+                    end_date,
+                )
+                full_frame, full_source = self._fetch_daily(
+                    symbol, full_start, end_date
+                )
+                if len(full_frame):
+                    fetched, source = full_frame, full_source
+
+            anchor_date = str(fetched.iloc[-1]["trade_date"]) if len(fetched) else ""
+            data_version = f"{source}|{anchor_date}|{now.strftime('%Y%m%dT%H%M%SZ')}"
+            merged = self._normalize_frame(
+                pd.concat([existing, fetched], ignore_index=True)
+            )
             upsert_daily_bars(
                 symbol,
                 fetched.to_dict(orient="records"),
                 source,
                 self.database,
+                adjust="qfq",
+                adj_anchor_date=anchor_date,
+                data_version=data_version,
             )
 
         return {
@@ -821,4 +877,8 @@ class StockDataService:
             "latest_date": datetime.strptime(
                 merged.iloc[-1]["trade_date"], "%Y%m%d"
             ).date().isoformat(),
+            "rebased": rebased,
+            "rebase_factor": rebase_report.factor,
+            "rebase_reason": rebase_report.reason,
+            "data_version": data_version,
         }

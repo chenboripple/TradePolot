@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any, Iterable, List, Mapping
 
 
-DATABASE_SCHEMA_VERSION = 11
+DATABASE_SCHEMA_VERSION = 13
 
 
 BACKTEST_COLUMNS = {
@@ -30,6 +30,15 @@ BACKTEST_COLUMNS = {
     "strategy_key": "strategy_key TEXT",
     "bar_count": "bar_count INTEGER",
     "execution": "execution TEXT",
+    # 完整回测结果（权益曲线/成交明细/指标），供前端历史回放
+    "result_json": "result_json TEXT",
+    # v12（A8）：CLI 回测/walk-forward 落库与来源溯源。
+    # run_kind='backtest'|'walkforward'；user_id 为 NULL 表示 CLI 跑的非用户记录
+    # （list_user_backtests 按 user_id 过滤，NULL 行不进用户列表）。
+    "run_kind": "run_kind TEXT DEFAULT 'backtest'",
+    "params_json": "params_json TEXT",
+    "profile_source": "profile_source TEXT",
+    "report_json": "report_json TEXT",
 }
 
 USER_COLUMNS = {
@@ -88,6 +97,12 @@ DAILY_BAR_COLUMNS = {
     "amount": "amount REAL",
     "source": "source TEXT DEFAULT ''",
     "updated_at": "updated_at TIMESTAMP",
+    # v12（A9）：复权溯源。adjust='qfq'|'raw'；adj_anchor_date=复权锚定日
+    # （拉取时最新交易日，混接根因）；data_version='source|anchor|utc_ts'
+    # （signal_ledger 与 ml manifest 引用做溯源）。
+    "adjust": "adjust TEXT DEFAULT 'qfq'",
+    "adj_anchor_date": "adj_anchor_date TEXT DEFAULT ''",
+    "data_version": "data_version TEXT DEFAULT ''",
 }
 
 STOCK_CATALOG_COLUMNS = {
@@ -118,6 +133,49 @@ STOCK_QUOTE_COLUMNS = {
     "turnover_rate": "turnover_rate REAL",
     "quote_time": "quote_time TEXT DEFAULT ''",
     "source": "source TEXT DEFAULT ''",
+    "updated_at": "updated_at TIMESTAMP",
+}
+
+# v13（B2）：信号台账。每个 (symbol, trade_date, source, provisional) 一行，记录
+# 当时的投票决策、（D 阶段）模型输出，以及用 B1 标签回填的前瞻净收益/下行风险。
+# label_status: pending（待回填）| filled（已回填）| expired（永不回填）| bad_data（决策日缺 bar）。
+# 与 backtest_results（run 粒度）、paper_ledger（fill 粒度）通过 backtest_id/symbol/trade_date
+# 松耦合，不合并。详见 docs/prediction-target.md。
+SIGNAL_LEDGER_COLUMNS = {
+    "id": "id INTEGER",
+    "symbol": "symbol TEXT",
+    "trade_date": "trade_date TEXT",
+    "source": "source TEXT DEFAULT 'monitor'",
+    "provisional": "provisional INTEGER DEFAULT 0",
+    "profile_name": "profile_name TEXT",
+    "params_json": "params_json TEXT",
+    "vote_threshold": "vote_threshold INTEGER",
+    "recommendation": "recommendation TEXT",
+    "buy_count": "buy_count INTEGER",
+    "sell_count": "sell_count INTEGER",
+    "components_json": "components_json TEXT",
+    "features_json": "features_json TEXT",
+    "model_id": "model_id TEXT",
+    "p_win": "p_win REAL",
+    "expected_ret": "expected_ret REAL",
+    "downside_mae": "downside_mae REAL",
+    "entry_price": "entry_price REAL",
+    "exit_price": "exit_price REAL",
+    "horizon": "horizon INTEGER DEFAULT 5",
+    "fwd_net_return": "fwd_net_return REAL",
+    "fwd_ret_aux": "fwd_ret_aux REAL",
+    "fwd_mae": "fwd_mae REAL",
+    "label_status": "label_status TEXT DEFAULT 'pending'",
+    "data_version": "data_version TEXT",
+    "backtest_id": "backtest_id INTEGER",
+    "filled_at": "filled_at TIMESTAMP",
+    "created_at": "created_at TIMESTAMP",
+}
+
+# v13（B2）：通用键值表，monitor 收盘例程记录"上次执行日"等状态，防重启重复跑。
+KV_STORE_COLUMNS = {
+    "key": "key TEXT",
+    "value": "value TEXT",
     "updated_at": "updated_at TIMESTAMP",
 }
 
@@ -394,6 +452,66 @@ def init_database(path: Path | None = None) -> Path:
             "CREATE INDEX IF NOT EXISTS idx_stock_quotes_time "
             "ON stock_quotes(quote_time DESC)"
         )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS signal_ledger (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol TEXT NOT NULL,
+                trade_date TEXT NOT NULL,
+                source TEXT NOT NULL DEFAULT 'monitor'
+                    CHECK(source IN ('monitor', 'backtest', 'dataset', 'manual')),
+                provisional INTEGER NOT NULL DEFAULT 0 CHECK(provisional IN (0, 1)),
+                profile_name TEXT,
+                params_json TEXT,
+                vote_threshold INTEGER,
+                recommendation TEXT,
+                buy_count INTEGER,
+                sell_count INTEGER,
+                components_json TEXT,
+                features_json TEXT,
+                model_id TEXT,
+                p_win REAL,
+                expected_ret REAL,
+                downside_mae REAL,
+                entry_price REAL,
+                exit_price REAL,
+                horizon INTEGER NOT NULL DEFAULT 5,
+                fwd_net_return REAL,
+                fwd_ret_aux REAL,
+                fwd_mae REAL,
+                label_status TEXT NOT NULL DEFAULT 'pending'
+                    CHECK(label_status IN ('pending', 'filled', 'expired', 'bad_data')),
+                data_version TEXT,
+                backtest_id INTEGER,
+                filled_at TIMESTAMP,
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(symbol, trade_date, source, provisional)
+            )
+            """
+        )
+        _ensure_columns(connection, "signal_ledger", SIGNAL_LEDGER_COLUMNS)
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_signal_ledger_status "
+            "ON signal_ledger(label_status, symbol)"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_signal_ledger_symbol_date "
+            "ON signal_ledger(symbol, trade_date DESC)"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_signal_ledger_backtest "
+            "ON signal_ledger(backtest_id)"
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS kv_store (
+                key TEXT PRIMARY KEY,
+                value TEXT,
+                updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        _ensure_columns(connection, "kv_store", KV_STORE_COLUMNS)
         integrity = connection.execute("PRAGMA integrity_check").fetchone()
         if not integrity or integrity[0] != "ok":
             raise RuntimeError(f"SQLite integrity check failed for {target}: {integrity}")
@@ -411,7 +529,8 @@ def load_daily_bars(
         rows = connection.execute(
             """
             SELECT trade_date, open, high, low, close, pre_close,
-                   change, pct_chg, volume AS vol, amount, source
+                   change, pct_chg, volume AS vol, amount, source,
+                   adjust, adj_anchor_date, data_version
             FROM daily_bars
             WHERE symbol = ?
             ORDER BY trade_date
@@ -421,12 +540,32 @@ def load_daily_bars(
     return [dict(row) for row in rows]
 
 
+def list_daily_bar_symbols(path: Path | None = None) -> List[str]:
+    """列出 daily_bars 中出现过的全部标的（A9 全库复权巡检用）。"""
+    target = init_database(path)
+    with sqlite3.connect(target, timeout=30) as connection:
+        rows = connection.execute(
+            "SELECT DISTINCT symbol FROM daily_bars "
+            "WHERE symbol IS NOT NULL AND symbol != '' ORDER BY symbol"
+        ).fetchall()
+    return [row[0] for row in rows]
+
+
 def upsert_daily_bars(
     symbol: str,
     rows: Iterable[Mapping[str, Any]],
     source: str,
     path: Path | None = None,
+    adjust: str = "qfq",
+    adj_anchor_date: str = "",
+    data_version: str = "",
 ) -> int:
+    """写入/更新某标的日线。
+
+    A9 复权溯源：``adjust``/``adj_anchor_date``/``data_version`` 是序列级元数据
+    （一次刷新一份），随整批写入；data_version 形如 ``source|anchor|utc_ts``，
+    供 signal_ledger 与 ml manifest 引用做前视/混接溯源。
+    """
     records = list(rows)
     if not records:
         return 0
@@ -436,8 +575,9 @@ def upsert_daily_bars(
             """
             INSERT INTO daily_bars (
                 symbol, trade_date, open, high, low, close,
-                pre_close, change, pct_chg, volume, amount, source, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                pre_close, change, pct_chg, volume, amount, source,
+                adjust, adj_anchor_date, data_version, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
             ON CONFLICT(symbol, trade_date) DO UPDATE SET
                 open = excluded.open,
                 high = excluded.high,
@@ -449,6 +589,9 @@ def upsert_daily_bars(
                 volume = excluded.volume,
                 amount = excluded.amount,
                 source = excluded.source,
+                adjust = excluded.adjust,
+                adj_anchor_date = excluded.adj_anchor_date,
+                data_version = excluded.data_version,
                 updated_at = CURRENT_TIMESTAMP
             """,
             [
@@ -465,6 +608,9 @@ def upsert_daily_bars(
                     row.get("vol", 0),
                     row.get("amount"),
                     source,
+                    adjust,
+                    adj_anchor_date,
+                    data_version,
                 )
                 for row in records
             ],

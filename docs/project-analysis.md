@@ -18,11 +18,11 @@
 
 ### 配置统一
 
-项目同时使用 `feishu.webhook_url` 和 `notifiers.feishu.webhook` 两套结构，部分脚本还固定读取根目录 `config.yaml`。应逐步统一为一个带版本号的配置模型，并使用 Pydantic 做启动时校验。此次改动先兼容两套结构，并允许通过 `TRADEPILOT_CONFIG` 指定路径。
+~~项目同时使用 `feishu.webhook_url` 和 `notifiers.feishu.webhook` 两套结构~~（已统一为 `notifiers.feishu.{enabled,webhook,secret,dashboard_url}`，`TRADEPILOT_CONFIG` 可指定路径）。后续可进一步引入带版本号的配置模型，用 Pydantic 做启动时校验。
 
 ### 测试体系
 
-`pyproject.toml` 指向 `tests/`，但仓库没有标准测试目录；根目录的 `test_*.py` 多数是会访问真实外部接口的手工脚本。建议建立三层测试：纯策略单元测试、带固定行情夹具的回测回归测试、显式标记的外部接口集成测试。发布镜像前至少执行单元测试和固定样本回测。
+`tests/` 已建立离线测试体系（策略/回测引擎/API/监控通知/数据清洗，CI 在 push/PR 上运行 `pytest tests/ -q`）；根目录访问真实接口的手工 `test_*.py` 已归档至 `experiments/`。后续可补充：带固定行情夹具的回归基线、显式标记的外部接口集成测试层。
 
 ### 依赖可复现性
 
@@ -40,7 +40,7 @@
 
 ### 代码边界
 
-将根目录研究脚本迁入 `experiments/`，可复用逻辑迁入包内；生成数据和报告移出源码树。`src/data` 不应存储运行期数据库。CLI 中多个命令仍为 TODO，应删除未实现入口或连接到真实服务，避免误导使用者。
+~~将根目录研究脚本迁入 `experiments/`~~（已完成，38 个脚本归档，见 `experiments/README.md`；根目录仅保留 `monitor_brief.py`、`heartbeat_tradepilot.py`、`install.py`、`setup.py`）。~~CLI 中多个命令仍为 TODO~~（已清理，`tradepilot` 各命令均连接真实服务）。剩余：生成数据和报告移出源码树；`src/data` 不应存储运行期数据库。
 
 ### 可观测性
 
@@ -48,11 +48,11 @@
 
 ### 回测可信度
 
-需要为手续费、滑点、涨跌停、停牌、除权复权、成交量约束和未来函数建立固定测试。策略参数优化应采用训练/验证/样本外窗口，记录策略与数据版本，降低过拟合风险。
+统一回测引擎已落地：次日开盘撮合（消除前视）、涨跌停拦截、佣金/印花税/滑点、回撤闸门，并提供 walk-forward 样本外验证（`tradepilot walkforward`）；历史研究报告已逐份加注可信度横幅，研究期脚本归档至 `experiments/`。剩余：停牌、除权复权、成交量约束的固定测试；记录策略与数据版本。
 
 ### 元数据一致性
 
-README 中仓库名写成了 `TradePolot`，许可证写为 MIT，而仓库的许可证提交说明为 CC BY-NC-SA 4.0。发布前必须确认真实许可证并统一 README、`pyproject.toml` 和 LICENSE。
+~~README 中仓库名写成了 `TradePolot`~~（已修正）。许可证已统一为 MIT：README、`pyproject.toml` classifier 与 `LICENSE` 文件三处一致。
 
 ## 已落地的部署改进
 
@@ -62,3 +62,10 @@ README 中仓库名写成了 `TradePolot`，许可证写为 MIT，而仓库的�
 - GitHub Actions 自动发布 amd64/arm64 镜像。
 - Watchtower 仅更新带标签的 TradePilot 服务，支持滚动重启和旧镜像清理。
 - 本地构建与生产镜像部署采用同一份 Compose 服务定义。
+
+## 已落地（2026-09 复核）
+
+- **断链修复**：monitor 配置路径、定期报告发送（原构建卡片后丢弃）、游客首屏公开行情链路。
+- **可信度与口径**：持仓日夏普口径及文档纠偏、A 股红涨绿跌全仓统一（`REC_BUY/REC_SELL/REC_HOLD` 常量）、监控信号附止损/止盈参考位、行情脏值中位数过滤、24 份历史报告加注可信度横幅。
+- **体验打磨**：飞书 interactive 卡片 + 监控台跳转按钮、K 线/权益曲线触摸十字线、回测表单选项由 `/api/meta/backtest-options` 后端驱动、CLI 输出脱敏飞书密钥。
+- **结构治理**：38 个研究脚本归档 `experiments/`（含 README 口径警示）、文档失效引用与旧仓库路径批量修正、测试扩至 138 个并由 CI 执行。

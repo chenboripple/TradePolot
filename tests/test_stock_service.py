@@ -7,6 +7,9 @@ from unittest.mock import patch
 import httpx
 import pandas as pd
 
+import synth
+
+from ripple_tradePilot.data.adjustment import audit_series
 from ripple_tradePilot.data.stock_service import (
     InvalidStockSymbolError,
     StockDataService,
@@ -44,6 +47,32 @@ class FakeStockDataService(StockDataService):
                 },
             ]
         )
+
+
+class RebaseFakeService(StockDataService):
+    """第二次起把整段序列 ×0.9，模拟上游 qfq 重算（复权基准漂移）。
+
+    与 FakeStockDataService 一样忽略请求窗口、返回全量行——detect_rebase 只比对
+    重叠交易日，窗口仅用于断言"全量重拉确实扩窗"。
+    """
+
+    def __init__(self, base_rows, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.base_rows = base_rows
+        self.rebased_mode = False
+        self.calls = []  # [(start_date, end_date), ...]
+
+    def _fetch_tushare(self, symbol, start_date, end_date):
+        self.calls.append((start_date, end_date))
+        rows = (
+            synth.scale_rows(self.base_rows, 0.9)
+            if self.rebased_mode
+            else self.base_rows
+        )
+        # synth.daily_rows 同时带 vol/volume；源帧只应有一种成交量列名，
+        # 否则 _normalize_frame 的 volume→vol 重命名会产生重复列。
+        frame_rows = [{k: v for k, v in row.items() if k != "volume"} for row in rows]
+        return pd.DataFrame(frame_rows)
 
 
 class FakeTushareLoader:
@@ -114,6 +143,67 @@ class StockDataServiceTest(unittest.TestCase):
             self.assertEqual(result["total_rows"], 2)
             self.assertEqual(len(rows), 2)
             self.assertEqual(rows[-1]["close"], 11.8)
+
+    def test_refresh_detects_rebase_and_full_refetches(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = root / "config.yaml"
+            config.write_text(
+                "symbols:\n  - code: 600000.SH\n    name: 测试银行\n",
+                encoding="utf-8",
+            )
+            database = root / "market.db"
+            base_rows = synth.daily_rows(synth.daily_bars(60, seed=11))
+            service = RebaseFakeService(base_rows, config_path=config, database=database)
+
+            # 第一次刷新：库空，正常落库（anchor A）
+            first = service.refresh("600000", initial_days=365)
+            self.assertFalse(first["rebased"])
+            self.assertEqual(len(load_daily_bars("600000.SH", database)), 60)
+            self.assertEqual(len(service.calls), 1)
+
+            # 第二次刷新：上游整段 ×0.9（anchor B）→ 检测命中 → 全量重拉
+            service.rebased_mode = True
+            second = service.refresh("600000", initial_days=365)
+
+            self.assertTrue(second["rebased"])
+            self.assertAlmostEqual(second["rebase_factor"], 0.9, places=3)
+            # 调用 3 次：初次 + 重叠窗 + 全量重拉
+            self.assertEqual(len(service.calls), 3)
+            overlap_start, full_start = service.calls[1][0], service.calls[2][0]
+            self.assertLess(full_start, overlap_start)  # 全量重拉窗口更宽
+
+            rows = load_daily_bars("600000.SH", database)
+            self.assertEqual(len(rows), 60)
+            # 库内整段被新锚覆盖：close ≈ 原 ×0.9，且 data_version/anchor 已更新
+            for original, stored in zip(base_rows, rows):
+                self.assertAlmostEqual(
+                    stored["close"], round(original["close"] * 0.9, 4), places=4
+                )
+                self.assertEqual(stored["data_version"], second["data_version"])
+                self.assertEqual(stored["adj_anchor_date"], base_rows[-1]["trade_date"])
+                self.assertEqual(stored["adjust"], "qfq")
+            # 覆盖后序列内部自洽（无新旧锚混接点）
+            self.assertTrue(audit_series(rows).clean)
+
+    def test_refresh_overlap_window_is_configurable(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = root / "config.yaml"
+            config.write_text(
+                "symbols:\n  - code: 600000.SH\n    name: 测试银行\n"
+                "data:\n  refresh_overlap_days: 5\n",
+                encoding="utf-8",
+            )
+            database = root / "market.db"
+            base_rows = synth.daily_rows(synth.daily_bars(40, seed=13))
+            service = RebaseFakeService(base_rows, config_path=config, database=database)
+            service.refresh("600000", initial_days=365)  # 落库
+            service.refresh("600000", initial_days=365)  # 增量：回看窗按配置
+            # 第二次（增量）请求的 start 应为 latest-5d，而非默认 30d
+            overlap_start = datetime.strptime(service.calls[1][0], "%Y%m%d")
+            latest = datetime.strptime(base_rows[-1]["trade_date"], "%Y%m%d")
+            self.assertEqual((latest - overlap_start).days, 5)
 
     def test_catalog_refresh_persists_latest_names_and_basic_info(self):
         with tempfile.TemporaryDirectory() as temp_dir:

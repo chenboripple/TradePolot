@@ -29,9 +29,9 @@
    - 检查次数
    - 买入/卖出/观望股票统计
 
-2. **交易信号**（仅当有明确信号时）
-   - 🟢 买入信号（≥2 个策略看涨）
-   - 🔴 卖出信号（≥2 个策略看跌）
+2. **交易信号**（仅当有明确信号时，A 股口径：红=买，绿=卖）
+   - 🔴 买入信号（≥2 个策略看涨）
+   - 🟢 卖出信号（≥2 个策略看跌）
    - 详细 K 线数据和策略分析
 
 ### 通知频率
@@ -76,7 +76,7 @@
 
 ### 查看监控状态
 ```bash
-ps aux | grep "monitor/main.py"
+ps aux | grep "tradepilot monitor"
 ```
 
 ### 查看进程日志
@@ -87,27 +87,27 @@ ps aux | grep "monitor/main.py"
 
 ### 停止监控
 ```bash
-pkill -f "monitor/main.py"
+pkill -f "tradepilot monitor"
 ```
 
 ### 重新启动
 ```bash
-cd /Users/ripple/work\ space/ripple_tradePilot
+cd /Users/ripple/work\ space/TradePilot
 source .venv/bin/activate
-PYTHONPATH=src python3 src/ripple_tradePilot/monitor/main.py
+tradepilot monitor
 ```
 
 ### 后台运行
 ```bash
-cd /Users/ripple/work\ space/ripple_tradePilot
+cd /Users/ripple/work\ space/TradePilot
 source .venv/bin/activate
-nohup bash -c "PYTHONPATH=src python3 src/ripple_tradePilot/monitor/main.py" > monitor.log 2>&1 &
+nohup bash -c "tradepilot monitor" > monitor.log 2>&1 &
 
 # 查看日志
 tail -f monitor.log
 
 # 停止
-pkill -f "monitor/main.py"
+pkill -f "tradepilot monitor"
 ```
 
 ---
@@ -147,18 +147,18 @@ pkill -f "monitor/main.py"
 
 **测试：**
 ```bash
-python3 test_feishu.py
+python3 experiments/test_feishu.py
 ```
 
 ### 问题 2: 监控进程意外退出
 **检查：**
 ```bash
-ps aux | grep "monitor/main.py"
+ps aux | grep "tradepilot monitor"
 ```
 
 **重启：**
 ```bash
-python3 src/ripple_tradePilot/monitor/main.py
+tradepilot monitor
 ```
 
 ### 问题 3: 数据获取失败

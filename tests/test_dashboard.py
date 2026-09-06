@@ -114,8 +114,55 @@ class DashboardServiceTest(unittest.TestCase):
         self.assertEqual(detail["asset_class"], "future")
         self.assertEqual(detail["exchange"], "CFFEX")
         self.assertEqual(len(detail["bars"]), 40)
-        self.assertIn(detail["recommendation"], {"BUY", "SELL", "HOLD"})
+        # 统一口径新增 CONFLICT 第四态
+        self.assertIn(detail["recommendation"], {"BUY", "SELL", "HOLD", "CONFLICT"})
         self.assertIsNotNone(detail["indicators"]["ma_slow"])
+
+    def test_market_detail_conflict_on_linear_rise(self):
+        # 线性上涨：MA 多头(BUY)、RSI=100 超买(SELL)、布林不触轨 → 阈值 2 下 strict 判冲突。
+        # 旧 dashboard majority 规则会把它误判成 BUY（buy>sell），统一口径修正为 CONFLICT。
+        detail = self._service().market_detail("000001.SZ")
+        self.assertEqual(detail["recommendation"], "CONFLICT")
+        self.assertTrue(detail["is_conflict"])
+        self.assertEqual(detail["buy_count"], 1)
+        self.assertEqual(detail["sell_count"], 1)
+        self.assertEqual(detail["votes"], {"ma": "BUY", "rsi": "SELL", "bollinger": "HOLD"})
+        self.assertIn("信号冲突", detail["reason"])
+
+    def test_confidence_removed_vote_ratio_present(self):
+        detail = self._service().market_detail("000001.SZ")
+        self.assertNotIn("confidence", detail)
+        self.assertIn("vote_ratio", detail)
+        # 1 票 / 3 组件 → 33%
+        self.assertEqual(detail["vote_ratio"], 33)
+        self.assertEqual(detail["profile_source"], "config")
+
+    def test_dashboard_honors_strict_voting_rule(self):
+        """A2 黄金一致性：dashboard 输出严格遵守 signals 的 strict 规则与 vote_ratio 契约。"""
+        for code in ("000001.SZ", "IF2609.CFFEX"):
+            for threshold in (1, 2, 3):
+                detail = self._service().market_detail(
+                    code,
+                    profile_override={**self._profile(), "vote_threshold": threshold},
+                )
+                votes = list(detail["votes"].values())
+                buy = sum(v == "BUY" for v in votes)
+                sell = sum(v == "SELL" for v in votes)
+                if buy >= threshold and sell == 0:
+                    expected = "BUY"
+                elif sell >= threshold and buy == 0:
+                    expected = "SELL"
+                elif buy or sell:
+                    expected = "CONFLICT"
+                else:
+                    expected = "HOLD"
+                self.assertEqual(detail["recommendation"], expected, (code, threshold))
+                self.assertEqual(detail["buy_count"], buy)
+                self.assertEqual(detail["sell_count"], sell)
+                self.assertEqual(
+                    detail["vote_ratio"], round(max(buy, sell) / len(votes) * 100)
+                )
+                self.assertEqual(detail["is_conflict"], expected == "CONFLICT")
 
     def test_market_detail_prefers_database_daily_bars(self):
         database = self.root / "market.db"

@@ -35,8 +35,8 @@ msg: sign match fail or timestamp is not within one hour from current time
 
 4. **测试发送**
    ```bash
-   cd /Users/ripple/work\ space/ripple_tradePilot
-   python3 send_feishu_test.py
+   cd /Users/ripple/work\ space/TradePilot
+   python3 experiments/send_feishu_test.py
    ```
 
 ---
@@ -94,7 +94,7 @@ BB:  20/2.0
 ## 📁 数据文件位置
 
 ```
-/Users/ripple/work space/ripple_tradePilot/data/backtest/
+/Users/ripple/work space/TradePilot/data/backtest/
 ├── 002022_SZ_optimized_result.json    # 002022 回测结果
 ├── 600309_SH_optimized_result.json    # 600309 回测结果
 ├── 002022_SZ_optimization.json        # 002022 参数优化
@@ -109,7 +109,7 @@ BB:  20/2.0
 关闭签名校验后，运行以下命令测试：
 
 ```bash
-cd /Users/ripple/work\ space/ripple_tradePilot
+cd /Users/ripple/work\ space/TradePilot
 python3 -c "
 import httpx
 WEBHOOK = 'https://open.feishu.cn/open-apis/bot/v2/hook/859cba37-0ce9-4381-90d4-dc15140af209'

@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#f4f6f8">
   <title>TradePilot 交易监控台</title>
-  <link rel="stylesheet" href="/assets/app.css?v=15">
+  <link rel="stylesheet" href="/assets/app.css?v=19">
 </head>
 <body>
   <header class="topbar">
@@ -76,9 +76,11 @@
           <span class="gate-mark">01</span>
           <h2>登录后看市场总览</h2>
           <p>三大指数、涨跌家数与成交额概览，行情优先取自妙想实时数据。</p>
+          <p class="gate-hint">不登录也能用：观察池行情、K 线与系统策略判断、全部数据目录均为公开数据。</p>
           <div class="gate-actions">
             <button class="primary-button" data-auth-mode="register">注册账号</button>
             <button class="secondary-button" data-auth-mode="login">登录</button>
+            <button class="secondary-button" id="gate-public-button" type="button">先看公开行情</button>
           </div>
         </section>
         <section class="market-overview authenticated-content" id="market-overview" hidden>
@@ -132,7 +134,7 @@
             <div class="recommendation-block">
               <span>当前倾向</span>
               <strong id="recommendation">--</strong>
-              <small id="confidence">--</small>
+              <small id="vote-ratio" title="规则投票占比，不是概率">--</small>
             </div>
           </header>
 
@@ -269,20 +271,22 @@
           </div>
           <form id="backtest-form" class="backtest-form">
             <label class="field"><span>股票代码</span><input name="symbol" minlength="6" maxlength="16" placeholder="600309 或 002022.SZ" autocomplete="off" list="symbol-options" required></label>
+            <!-- 选项由 /api/meta/backtest-options 动态填充；此处仅保留后端默认项兜底 -->
             <label class="field"><span>策略</span><select name="strategy">
-              <option value="ma">均线交叉 (MA)</option>
               <option value="rsi" selected>RSI 反转</option>
-              <option value="macd">MACD 趋势</option>
-              <option value="bollinger">布林带</option>
-              <option value="donchian">唐奇安通道</option>
+            </select></label>
+            <!-- A5：画像下拉（system / config 画像名）；仅 combo_vote 可用，单策略禁用 -->
+            <label class="field"><span>策略画像</span><select name="profile" disabled>
+              <option value="" selected>缺省解析链</option>
             </select></label>
             <label class="field"><span>K 线根数</span><input name="bars" type="number" min="60" max="2500" step="1" value="252" required></label>
             <label class="field"><span>撮合模式</span><select name="execution">
               <option value="next_open" selected>次日开盘撮合</option>
-              <option value="close">当日收盘撮合</option>
             </select></label>
             <div class="field"><span>基准对比</span><label class="backtest-benchmark-toggle"><input type="checkbox" name="benchmark"> 对比沪深300</label></div>
             <button class="primary-button backtest-submit" id="backtest-submit" type="submit">开始回测</button>
+            <!-- A5：策略参数由 params_schema 动态渲染（留空=用画像/缺省链，填写=显式覆盖→explicit）-->
+            <div class="backtest-params field-wide" id="backtest-params" hidden></div>
           </form>
           <p class="form-error" id="backtest-error" hidden></p>
 
@@ -291,6 +295,8 @@
               <h3 id="backtest-result-title">--</h3>
               <span id="backtest-result-meta">--</span>
             </div>
+            <!-- A5 provenance：这次回测实际跑了哪套参数、来自哪里（explicit/system/config/default）-->
+            <p class="backtest-provenance" id="backtest-provenance" hidden></p>
             <div class="backtest-notes" id="backtest-notes"></div>
             <div class="metrics-band">
               <div class="metric"><span>总收益</span><strong id="bt-total-return">--</strong><small>区间净值变化</small></div>
@@ -404,6 +410,6 @@
 
   <div class="toast-container" id="toast-container" aria-live="polite"></div>
 
-  <script src="/assets/app.js?v=15" defer></script>
+  <script src="/assets/app.js?v=19" defer></script>
 </body>
 </html>

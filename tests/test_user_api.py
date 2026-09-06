@@ -284,6 +284,31 @@ class UserApiTest(unittest.TestCase):
         self.assertEqual(self.client.get("/api/strategies").status_code, 401)
         self.assertEqual(self.client.get("/api/backtests").status_code, 401)
 
+    def test_guest_landing_public_data_chain(self):
+        """游客首屏链路：配置观察池 + 目录 + 日线齐备时，匿名可拿到完整公开数据；
+        账号功能（市场总览/策略/回测）注册墙保留。"""
+        self.config.write_text(
+            'symbols:\n  - code: "600000.SH"\n    name: "测试银行"\n    asset_class: stock\nfutures: []\n',
+            encoding="utf-8",
+        )
+        upsert_stock_catalog(
+            [{"symbol": "600000.SH", "name": "测试银行"}], "test", self.database
+        )
+        ApiStockDataService().refresh("600000")
+
+        dashboard = self.client.get("/api/dashboard")
+        self.assertEqual(dashboard.status_code, 200)
+        markets = dashboard.json()["markets"]
+        self.assertEqual([item["symbol"] for item in markets], ["600000.SH"])
+        self.assertTrue(markets[0]["bars"], "游客落地页依赖 dashboard 内嵌 K 线")
+
+        detail = self.client.get("/api/markets/600000.SH?system_strategy=true")
+        self.assertEqual(detail.status_code, 200)
+        self.assertTrue(detail.json()["bars"])
+
+        self.assertEqual(self.client.get("/api/stocks").status_code, 200)
+        self.assertEqual(self.client.get("/api/market/overview").status_code, 401)
+
     def test_public_strategies_are_shared_but_private_strategies_are_not(self):
         alice = self.register("alice")
         self.assertEqual(alice["role"], "admin")

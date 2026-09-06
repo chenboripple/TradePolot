@@ -62,9 +62,9 @@ https://open.feishu.cn/app/cli_a93f27f7f4789bca/auth?q=im:chat:readonly,im:chat,
 
 权限开通后，运行：
 ```bash
-cd /Users/ripple/work\ space/ripple_tradePilot
+cd /Users/ripple/work\ space/TradePilot
 source .venv/bin/activate
-PYTHONPATH=src python3 test_feishu_direct.py
+PYTHONPATH=src python3 experiments/test_feishu_direct.py
 ```
 
 会显示机器人所在的群聊列表和 chat_id。
@@ -97,9 +97,9 @@ notifiers:
 运行测试脚本：
 
 ```bash
-cd /Users/ripple/work\ space/ripple_tradePilot
+cd /Users/ripple/work\ space/TradePilot
 source .venv/bin/activate
-PYTHONPATH=src python3 test_feishu.py
+PYTHONPATH=src python3 experiments/test_feishu.py
 ```
 
 ---

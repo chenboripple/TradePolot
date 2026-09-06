@@ -61,7 +61,7 @@ for code, expected_name in symbols:
     data = get_sina_quote(code)
     if data:
         change_pct = data['change_pct']
-        emoji = '🟢' if change_pct > 0 else '🔴' if change_pct < 0 else '⚪'
+        emoji = '🔴' if change_pct > 0 else '🟢' if change_pct < 0 else '⚪'  # A 股口径：红涨绿跌
         print(f"{emoji} **{data['name']}** ({code})")
         print(f"收盘价：{data['close']} | 涨跌：{change_pct:+.2f}%")
         print(f"开盘：{data['open']} | 最高：{data['high']} | 最低：{data['low']}")

@@ -13,6 +13,7 @@ from typing import Iterable, List
 from uuid import uuid4
 
 from ripple_tradePilot.backtest.engine import run_backtest
+from ripple_tradePilot.backtest.rules import MarketRules, price_limit_for_symbol
 from ripple_tradePilot.models.types import Bar, Fill
 from ripple_tradePilot.risk.manager import RiskConfig
 from ripple_tradePilot.storage import paper_ledger
@@ -41,6 +42,8 @@ def paper_trade(
         initial_cash=starting_cash,
         fee_rate=fee_rate,
         risk_config=risk_config,
+        # 按标的板块推导涨跌停（symbol 为空时 price_limit_for_symbol 返回主板 10%=引擎默认）
+        market_rules=MarketRules(price_limit_pct=price_limit_for_symbol(symbol)),
     )
     if ledger:
         resolved_run_id = run_id or str(uuid4())

@@ -1,7 +1,9 @@
 """POST /api/backtest 端点的离线测试（tmp DB + mock 行情，不联网）。"""
 import importlib
+import json
 import math
 import os
+import sqlite3
 import tempfile
 import unittest
 from datetime import date, timedelta
@@ -80,6 +82,74 @@ class WebBacktestApiTest(unittest.TestCase):
             "/api/backtest", json={"symbol": SYMBOL, "strategy": "ma"}
         )
         self.assertEqual(response.status_code, 401)
+
+    def _seed_system_strategy(self, parameters, symbol=SYMBOL):
+        """在 tmp DB 预置一条系统策略（system_key=stock:<symbol>），供 profile=system 解析。"""
+        with sqlite3.connect(database_path()) as connection:
+            user_id = connection.execute(
+                "SELECT id FROM users WHERE username = 'alice'"
+            ).fetchone()[0]
+            connection.execute(
+                """
+                INSERT INTO strategies (
+                    user_id, name, asset_class, symbol, profile,
+                    parameters_json, visibility, system_key
+                ) VALUES (?, ?, 'stock', ?, 'combo_vote', ?, 'public', ?)
+                """,
+                (
+                    user_id,
+                    f"系统:{symbol}",
+                    symbol,
+                    json.dumps(parameters, ensure_ascii=False),
+                    f"stock:{symbol}",
+                ),
+            )
+
+    def test_backtest_options_metadata_matches_registry(self):
+        """/api/meta/backtest-options 是前端下拉的单一来源（A5 四方一致）：
+        注册表 == meta strategies == 标签表 == 请求模型 Literal == params_schema 键集；匿名可用。"""
+        from typing import get_args
+
+        from ripple_tradePilot.signals.backtest_profile import (
+            BACKTEST_STRATEGIES,
+            params_schema,
+        )
+
+        response = self.client.get("/api/meta/backtest-options")  # 未注册未登录
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+
+        strategy_values = [item["value"] for item in data["strategies"]]
+        # 四方对齐：共享注册表 == meta 下发 == 标签表 == 请求模型 Literal
+        self.assertEqual(set(strategy_values), set(BACKTEST_STRATEGIES))
+        self.assertEqual(set(strategy_values), set(api_module._BACKTEST_STRATEGY_LABELS))
+        self.assertEqual(
+            set(strategy_values),
+            set(get_args(api_module.BacktestRequest.model_fields["strategy"].annotation)),
+        )
+        # 第四方：params_schema 键集 == 注册表，且 meta 逐策略下发的 schema 与单一来源一致
+        schema = params_schema()
+        self.assertEqual(set(schema), set(BACKTEST_STRATEGIES))
+        for item in data["strategies"]:
+            self.assertEqual(
+                item["params_schema"],
+                schema[item["value"]],
+                f"{item['value']} 的 params_schema 与单一来源不一致",
+            )
+        # A5 新增 combo_vote 进注册表与下拉
+        self.assertIn("combo_vote", strategy_values)
+        self.assertIn(data["default_strategy"], strategy_values)
+        self.assertTrue(all(item["label"] for item in data["strategies"]))
+        # profiles 下拉至少含 system 项（config 画像名在无 config 时为空）
+        self.assertIn("system", [profile["value"] for profile in data["profiles"]])
+
+        execution_values = [item["value"] for item in data["executions"]]
+        self.assertEqual(
+            set(execution_values),
+            set(get_args(api_module.BacktestRequest.model_fields["execution"].annotation)),
+        )
+        self.assertEqual(set(execution_values), set(api_module._BACKTEST_EXECUTION_LABELS))
+        self.assertIn(data["default_execution"], execution_values)
 
     def test_backtest_returns_metrics_and_curve(self):
         self.register()
@@ -282,6 +352,202 @@ class WebBacktestApiTest(unittest.TestCase):
     def test_delete_backtest_requires_login(self):
         response = self.client.delete("/api/backtests/1")
         self.assertEqual(response.status_code, 401)
+
+    def test_backtest_detail_replay(self):
+        """GET /api/backtests/{id} 返回保存的完整结果，供历史回放。"""
+        self.register("alice")
+        upsert_daily_bars(SYMBOL, _seed_rows(), "test", database_path())
+        created = self.client.post(
+            "/api/backtest", json={"symbol": SYMBOL, "strategy": "ma", "bars": 100}
+        )
+        self.assertEqual(created.status_code, 200, created.text)
+        live = created.json()["data"]
+        record_id = self.client.get("/api/backtests").json()["items"][0]["id"]
+
+        replay = self.client.get(f"/api/backtests/{record_id}")
+        self.assertEqual(replay.status_code, 200, replay.text)
+        data = replay.json()["data"]
+        # 回放数据与即时回测一致：曲线、成交、指标齐全
+        self.assertEqual(data["symbol"], SYMBOL)
+        self.assertEqual(data["strategy"], "ma")
+        self.assertEqual(len(data["equity_curve"]), 100)
+        self.assertEqual(data["metrics"], live["metrics"])
+        self.assertEqual(data["fills"], live["fills"])
+
+    def test_backtest_detail_forbidden_for_other_user(self):
+        """他人记录回放返回 404；不存在的 id 也返回 404。"""
+        self.register("alice")
+        upsert_daily_bars(SYMBOL, _seed_rows(), "test", database_path())
+        self.client.post(
+            "/api/backtest", json={"symbol": SYMBOL, "strategy": "ma", "bars": 100}
+        )
+        record_id = self.client.get("/api/backtests").json()["items"][0]["id"]
+
+        self.register("bob")
+        response = self.client.get(f"/api/backtests/{record_id}")
+        self.assertEqual(response.status_code, 404, response.text)
+        self.assertEqual(self.client.get("/api/backtests/999999").status_code, 404)
+
+    def test_backtest_detail_requires_login(self):
+        response = self.client.get("/api/backtests/1")
+        self.assertEqual(response.status_code, 401)
+
+    # -- A5：combo_vote 接入 + 参数传递 + provenance -------------------------
+
+    def test_explicit_params_provenance_and_effect(self):
+        """显式 params 生效：provenance 标 explicit + 参数回显，且不同参数产出不同成交。"""
+        self.register()
+        upsert_daily_bars(SYMBOL, _seed_rows(), "test", database_path())
+
+        def run(params):
+            response = self.client.post(
+                "/api/backtest",
+                json={"symbol": SYMBOL, "strategy": "ma", "bars": 120, "params": params},
+            )
+            self.assertEqual(response.status_code, 200, response.text)
+            return response.json()["data"]
+
+        fast = run({"fast": 3, "slow": 8})
+        slow = run({"fast": 30, "slow": 60})
+        # provenance：来源 explicit + 实际参数原样回显
+        self.assertEqual(fast["profile_source"], "explicit")
+        self.assertEqual(fast["strategy_params"], {"fast": 3, "slow": 8})
+        self.assertEqual(fast["strategy"], "ma")
+        # 参数确实驱动回测：两组均线参数在同序列上成交明细不同
+        self.assertTrue(fast["fills"], "MA(3,8) 在正弦序列上应产生成交")
+        self.assertNotEqual(fast["fills"], slow["fills"], "不同均线参数应产出不同成交")
+
+    def test_combo_vote_runs_with_default_profile(self):
+        """combo_vote 无 params/profile：走缺省链（config 无绑定 → 全局默认画像），source=default。"""
+        self.register()
+        upsert_daily_bars(SYMBOL, _seed_rows(), "test", database_path())
+        response = self.client.post(
+            "/api/backtest",
+            json={"symbol": SYMBOL, "strategy": "combo_vote", "bars": 120},
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        data = response.json()["data"]
+        self.assertEqual(data["strategy"], "combo_vote")
+        self.assertEqual(data["profile_source"], "default")
+        self.assertIn("vote_threshold", data["strategy_params"])
+        self.assertEqual(
+            sorted(data["strategy_params"]["components"]), ["bollinger", "ma", "rsi"]
+        )
+
+    def test_combo_vote_explicit_threshold(self):
+        """combo_vote 显式参数：vote_threshold + 组件参数生效并回显。"""
+        self.register()
+        upsert_daily_bars(SYMBOL, _seed_rows(), "test", database_path())
+        response = self.client.post(
+            "/api/backtest",
+            json={
+                "symbol": SYMBOL, "strategy": "combo_vote", "bars": 120,
+                "params": {"vote_threshold": 3, "ma_fast": 3, "ma_slow": 8},
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        data = response.json()["data"]
+        self.assertEqual(data["profile_source"], "explicit")
+        self.assertEqual(data["strategy_params"]["vote_threshold"], 3)
+        self.assertEqual(data["strategy_params"]["components"]["ma"], {"fast": 3, "slow": 8})
+
+    def test_system_profile_resolution(self):
+        """profile=system：读 tmp DB 预置的系统策略参数 → combo_vote，source=system。"""
+        self.register()
+        self._seed_system_strategy({"ma_fast": 3, "ma_slow": 9, "vote_threshold": 1})
+        upsert_daily_bars(SYMBOL, _seed_rows(), "test", database_path())
+        response = self.client.post(
+            "/api/backtest",
+            json={"symbol": SYMBOL, "strategy": "combo_vote", "bars": 120, "profile": "system"},
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        data = response.json()["data"]
+        self.assertEqual(data["profile_source"], "system")
+        self.assertEqual(data["strategy_params"]["vote_threshold"], 1)
+        self.assertEqual(data["strategy_params"]["components"]["ma"], {"fast": 3, "slow": 9})
+
+    def test_config_profile_resolution(self):
+        """profile=名字：读 config.strategy_profiles → combo_vote，source=config:名字。"""
+        self.register()
+        upsert_daily_bars(SYMBOL, _seed_rows(), "test", database_path())
+        config = {
+            "symbols": [],
+            "strategy_profiles": {
+                "aggro": {"kind": "combo_vote", "ma_fast": 3, "ma_slow": 8, "vote_threshold": 1}
+            },
+        }
+        with patch.object(api_module, "load_config", return_value=config):
+            response = self.client.post(
+                "/api/backtest",
+                json={"symbol": SYMBOL, "strategy": "combo_vote", "bars": 120, "profile": "aggro"},
+            )
+        self.assertEqual(response.status_code, 200, response.text)
+        data = response.json()["data"]
+        self.assertEqual(data["profile_source"], "config:aggro")
+        self.assertEqual(data["strategy_params"]["vote_threshold"], 1)
+
+    def test_illegal_param_rejected_422(self):
+        """params 含策略白名单外的键 → 422（ma 不接受 window）。"""
+        self.register()
+        upsert_daily_bars(SYMBOL, _seed_rows(), "test", database_path())
+        response = self.client.post(
+            "/api/backtest",
+            json={"symbol": SYMBOL, "strategy": "ma", "bars": 100, "params": {"window": 5}},
+        )
+        self.assertEqual(response.status_code, 422, response.text)
+
+    def test_param_value_out_of_range_422(self):
+        """params 值越界 → 422（vote_threshold le=3；fast ge=1）。"""
+        self.register()
+        upsert_daily_bars(SYMBOL, _seed_rows(), "test", database_path())
+        over = self.client.post(
+            "/api/backtest",
+            json={"symbol": SYMBOL, "strategy": "combo_vote", "bars": 100,
+                  "params": {"vote_threshold": 9}},
+        )
+        self.assertEqual(over.status_code, 422, over.text)
+        zero = self.client.post(
+            "/api/backtest",
+            json={"symbol": SYMBOL, "strategy": "ma", "bars": 100, "params": {"fast": 0}},
+        )
+        self.assertEqual(zero.status_code, 422, zero.text)
+
+    def test_unknown_profile_rejected_422(self):
+        """profile 指向 config 中不存在的画像名 → 422。"""
+        self.register()
+        upsert_daily_bars(SYMBOL, _seed_rows(), "test", database_path())
+        with patch.object(
+            api_module, "load_config", return_value={"symbols": [], "strategy_profiles": {}}
+        ):
+            response = self.client.post(
+                "/api/backtest",
+                json={"symbol": SYMBOL, "strategy": "combo_vote", "bars": 100, "profile": "ghost"},
+            )
+        self.assertEqual(response.status_code, 422, response.text)
+
+    def test_provenance_persisted_to_db(self):
+        """A5 provenance 落库：backtest_results 写 run_kind/profile_source/params_json（v12 列）。"""
+        self.register()
+        upsert_daily_bars(SYMBOL, _seed_rows(), "test", database_path())
+        response = self.client.post(
+            "/api/backtest",
+            json={"symbol": SYMBOL, "strategy": "ma", "bars": 100,
+                  "params": {"fast": 4, "slow": 12}},
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        with sqlite3.connect(database_path()) as connection:
+            connection.row_factory = sqlite3.Row
+            row = connection.execute(
+                "SELECT run_kind, profile_source, params_json, strategy_key, user_id "
+                "FROM backtest_results ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        self.assertEqual(row["run_kind"], "backtest")
+        self.assertEqual(row["profile_source"], "explicit")
+        self.assertEqual(row["strategy_key"], "ma")
+        self.assertIsNotNone(row["user_id"])  # Web 回测仍归属用户（记录页可见）
+        params = json.loads(row["params_json"])
+        self.assertEqual(params["strategy"], "ma")
+        self.assertEqual(params["params"], {"fast": 4, "slow": 12})
 
 
 if __name__ == "__main__":

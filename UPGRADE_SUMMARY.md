@@ -87,14 +87,14 @@ ripple_tradePilot/
 
 ### 方式 1: 测试模式（单次检查）
 ```bash
-cd /Users/ripple/work\ space/ripple_tradePilot
+cd /Users/ripple/work\ space/TradePilot
 source .venv/bin/activate
 python3 test_monitor.py
 ```
 
 ### 方式 2: 实时监控（持续运行）
 ```bash
-cd /Users/ripple/work\ space/ripple_tradePilot
+cd /Users/ripple/work\ space/TradePilot
 source .venv/bin/activate
 PYTHONPATH=src python3 src/ripple_tradePilot/monitor/main.py
 ```

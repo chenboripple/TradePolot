@@ -1,5 +1,8 @@
 # TradePilot 回测功能实现总结
 
+
+> ⚠️ **可信度提示（2026-09 复核）**：本报告的高收益数字来自研究期脚本，存在前视撮合（当日收盘成交）、成本低估、参数在样本内寻优、窗口选择偏差等问题，**不可作为实盘预期**。统一口径回测（次日开盘撮合 + 涨跌停拦截 + 佣金/印花税/滑点 + 回撤闸门）请以 Web「回测记录」/ `tradepilot backtest` 与样本外验证为准。相关脚本已归档至 `experiments/`。
+
 ## ✅ 已完成功能
 
 ### 1. 回测模块
@@ -18,16 +21,16 @@
 
 ### 2. 回测脚本
 
-**文件：** `run_backtest.py`
+**文件：** `examples/run_backtest.py`
 
 **用法：**
 ```bash
 # 默认回测 002022 过去 90 天
-python3 run_backtest.py
+python3 examples/run_backtest.py
 
 # 自定义股票和天数
-python3 run_backtest.py 002022.SZ 科华生物 90
-python3 run_backtest.py 600519.SH 贵州茅台 180
+python3 examples/run_backtest.py 002022.SZ 科华生物 90
+python3 examples/run_backtest.py 600519.SH 贵州茅台 180
 ```
 
 ---
@@ -160,8 +163,8 @@ ripple_tradePilot/
 │       ├── *.json             # 回测结果
 │       ├── *_trades.csv       # 交易记录
 │       └── backtest_results.db # SQLite 数据库
-├── run_backtest.py            # ⭐新增：回测脚本
-├── quick_backtest.py          # ⭐新增：简化回测
+├── examples/run_backtest.py            # ⭐新增：回测脚本
+├── experiments/quick_backtest.py          # ⭐新增：简化回测
 └── config.yaml                # 配置文件
 ```
 
@@ -171,9 +174,9 @@ ripple_tradePilot/
 
 ### 示例 1: 回测单只股票
 ```bash
-cd /Users/ripple/work\ space/ripple_tradePilot
+cd /Users/ripple/work\ space/TradePilot
 source .venv/bin/activate
-PYTHONPATH=src python3 run_backtest.py 002022.SZ 科华生物 90
+PYTHONPATH=src python3 examples/run_backtest.py 002022.SZ 科华生物 90
 ```
 
 ### 示例 2: 批量回测多只股票
@@ -181,12 +184,12 @@ PYTHONPATH=src python3 run_backtest.py 002022.SZ 科华生物 90
 # 创建批量回测脚本
 cat > batch_backtest.sh << 'EOF'
 #!/bin/bash
-python3 run_backtest.py 002022.SZ 科华生物 90
-python3 run_backtest.py 600309.SH 万华化学 90
-python3 run_backtest.py 603039.SH 泛海微 90
-python3 run_backtest.py 000999.SZ 华润三九 90
-python3 run_backtest.py 000868.SZ 安凯客车 90
-python3 run_backtest.py 601816.SH 京沪高铁 90
+python3 examples/run_backtest.py 002022.SZ 科华生物 90
+python3 examples/run_backtest.py 600309.SH 万华化学 90
+python3 examples/run_backtest.py 603039.SH 泛海微 90
+python3 examples/run_backtest.py 000999.SZ 华润三九 90
+python3 examples/run_backtest.py 000868.SZ 安凯客车 90
+python3 examples/run_backtest.py 601816.SH 京沪高铁 90
 EOF
 
 chmod +x batch_backtest.sh
@@ -195,7 +198,7 @@ chmod +x batch_backtest.sh
 
 ### 示例 3: 查询历史回测结果
 ```bash
-cd /Users/ripple/work\ space/ripple_tradePilot
+cd /Users/ripple/work\ space/TradePilot
 source .venv/bin/activate
 PYTHONPATH=src python3 -c "
 import sqlite3
@@ -251,7 +254,7 @@ conn.close()
 ### 问题 2: 飞书通知失败
 **检查：**
 ```bash
-python3 test_feishu.py
+PYTHONPATH=src python3 experiments/test_feishu.py
 ```
 
 ### 问题 3: 数据获取失败

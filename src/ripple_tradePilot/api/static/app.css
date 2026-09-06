@@ -195,6 +195,7 @@ button:disabled { cursor: default; opacity: .55; }
 .side-buy { color: var(--buy); }
 .side-sell { color: var(--sell); }
 .side-hold { color: var(--hold); }
+.side-conflict { color: var(--hold); opacity: 0.8; }
 .watch-empty { padding: 24px 12px; color: var(--sidebar-muted); font-size: 12px; line-height: 1.7; }
 .sidebar-footer { display: flex; justify-content: space-between; padding: 13px 16px; border-top: 1px solid var(--line); color: var(--sidebar-muted); font-size: 10px; }
 
@@ -254,6 +255,7 @@ button:disabled { cursor: default; opacity: .55; }
 .indicator-switches label { display: flex; align-items: center; gap: 5px; cursor: pointer; }
 .indicator-switches input { accent-color: var(--info); }
 .chart-frame { position: relative; height: 390px; min-height: 300px; background: #fcfdfb; }
+.chart-frame canvas { touch-action: none; }
 #market-chart { display: block; width: 100%; height: 100%; }
 .chart-tooltip { position: absolute; z-index: 4; min-width: 154px; padding: 10px 12px; border: 0; border-radius: 8px; background: rgba(255,255,255,.97); box-shadow: var(--shadow-high); pointer-events: none; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 10px; line-height: 1.6; }
 .chart-empty { position: absolute; inset: 0; display: grid; place-items: center; color: var(--muted); }
@@ -312,7 +314,8 @@ button:disabled { cursor: default; opacity: .55; }
 .gate-mark { display: grid; place-items: center; width: 54px; height: 54px; border: 0; border-radius: 8px; background: var(--info-soft); color: #00201c; font-family: ui-monospace, monospace; font-size: 13px; font-weight: 800; }
 .access-gate h2 { margin: 17px 0 6px; font-size: 18px; }
 .access-gate p { margin: 0; color: var(--muted); font-size: 12px; }
-.gate-actions { display: flex; gap: 8px; margin-top: 20px; }
+.gate-actions { display: flex; gap: 8px; margin-top: 20px; flex-wrap: wrap; justify-content: center; }
+.access-gate p.gate-hint { margin-top: 10px; max-width: 430px; line-height: 1.7; }
 .table-panel { position: relative; overflow-x: auto; border: 0; border-radius: var(--radius); background: var(--surface); box-shadow: var(--shadow); }
 table { width: 100%; border-collapse: collapse; min-width: 820px; }
 th, td { height: 54px; padding: 0 16px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: middle; }
@@ -374,6 +377,7 @@ th.sortable.is-sorted-desc::after { content: " ↓"; color: var(--info); }
 .rec-buy { color: var(--buy); }
 .rec-sell { color: var(--sell); }
 .rec-hold { color: var(--hold); }
+.rec-conflict { color: var(--hold); opacity: 0.8; }
 
 .auto-refresh-toggle { display: flex; align-items: center; gap: 5px; margin-left: 6px; color: var(--muted); font-size: 12px; cursor: pointer; white-space: nowrap; }
 .auto-refresh-toggle input { accent-color: var(--info); }
@@ -383,9 +387,21 @@ th.sortable.is-sorted-desc::after { content: " ↓"; color: var(--info); }
 
 .backtest-runner { margin-bottom: 16px; padding: 18px 20px 20px; border: 0; border-radius: var(--radius); background: var(--surface); box-shadow: var(--shadow); }
 .backtest-runner .panel-heading span { font-size: 10px; }
-.backtest-form { display: grid; grid-template-columns: repeat(5, minmax(128px, 1fr)) auto; gap: 12px; align-items: end; margin-top: 14px; }
+.backtest-form { display: grid; grid-template-columns: repeat(6, minmax(112px, 1fr)) auto; gap: 12px; align-items: end; margin-top: 14px; }
 .backtest-form .field { margin-bottom: 0; }
 .backtest-form .field input, .backtest-form .field select { height: 40px; }
+.backtest-form .field select:disabled { opacity: 0.5; cursor: not-allowed; }
+/* A5：动态参数区（params_schema 渲染）——占满整行，留空=用画像/缺省，填写=显式覆盖 */
+.backtest-params { margin-top: 12px; }
+.bt-param-row { display: flex; flex-wrap: wrap; gap: 10px; }
+.bt-param { display: grid; gap: 4px; color: var(--muted); font-size: 11px; }
+.bt-param input { width: 104px; height: 36px; padding: 0 10px; border: 1px solid var(--line-strong); border-radius: 6px; background: var(--surface); color: var(--text); outline: none; }
+.bt-param input:focus { border-color: var(--info); box-shadow: 0 0 0 2px var(--info-soft); }
+.bt-param-advanced { margin-top: 10px; }
+.bt-param-advanced > summary { cursor: pointer; color: var(--muted); font-size: 11px; user-select: none; }
+.bt-param-advanced[open] > summary { margin-bottom: 8px; }
+/* A5 provenance：结果卡片说明参数来源与生效值 */
+.backtest-provenance { margin: 6px 0 0; color: var(--muted); font-size: 11px; }
 .backtest-benchmark-toggle { display: flex; align-items: center; gap: 6px; height: 40px; padding: 0 12px; border: 1px solid var(--line-strong); border-radius: 6px; background: var(--surface); color: var(--text); font-size: 12px; cursor: pointer; white-space: nowrap; }
 .backtest-benchmark-toggle input { accent-color: var(--info); }
 .backtest-submit { min-height: 40px; white-space: nowrap; }

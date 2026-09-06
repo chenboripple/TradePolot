@@ -97,9 +97,9 @@ for symbol_config in SYMBOLS:
         
         # 综合建议
         if buy_count >= 2:
-            recommendation = "🟢 买入"
+            recommendation = "🔴 买入"
         elif sell_count >= 2:
-            recommendation = "🔴 卖出"
+            recommendation = "🟢 卖出"
         elif buy_count == 1 or sell_count == 1:
             recommendation = "🟡 观望 (信号冲突)"
         else:
@@ -136,12 +136,12 @@ sell_stocks = [r for r in results if '卖出' in r['recommendation']]
 hold_stocks = [r for r in results if '观望' in r['recommendation']]
 
 if buy_stocks:
-    print(f"\n🟢 买入信号 ({len(buy_stocks)}只):")
+    print(f"\n🔴 买入信号 ({len(buy_stocks)}只):")
     for r in buy_stocks:
         print(f"   • {r['name']} ({r['code']}) - {r['price']:.2f}元")
 
 if sell_stocks:
-    print(f"\n🔴 卖出信号 ({len(sell_stocks)}只):")
+    print(f"\n🟢 卖出信号 ({len(sell_stocks)}只):")
     for r in sell_stocks:
         print(f"   • {r['name']} ({r['code']}) - {r['price']:.2f}元")
 

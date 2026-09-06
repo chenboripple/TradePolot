@@ -115,11 +115,146 @@ const elements = {
   toastContainer: document.querySelector("#toast-container"),
 };
 
-const recommendationLabels = { BUY: "偏多", SELL: "偏空", HOLD: "观望" };
+const recommendationLabels = { BUY: "偏多", SELL: "偏空", HOLD: "观望", CONFLICT: "分歧" };
 const voteLabels = { BUY: "偏多", SELL: "偏空", HOLD: "中性" };
 const assetLabels = { stock: "股票", future: "期货" };
-const backtestStrategyLabels = { ma: "均线交叉", rsi: "RSI 反转", macd: "MACD 趋势", bollinger: "布林带", donchian: "唐奇安通道" };
-const backtestExecutionLabels = { next_open: "次日开盘撮合", close: "当日收盘撮合" };
+// 回测策略/撮合模式/画像选项：由 /api/meta/backtest-options 下发（后端单一来源），
+// 这里只留与后端默认值一致的兜底项，接口失败时表单仍可用默认策略提交。
+// strategies[].params_schema 用于动态渲染参数输入（A5）。
+const backtestMeta = {
+  strategies: [{ value: "rsi", label: "RSI 反转" }],
+  executions: [{ value: "next_open", label: "次日开盘撮合" }],
+  profiles: [],
+};
+
+// A5 provenance：profile_source → 友好中文（结果卡片说明"参数来自哪里"）
+const PROFILE_SOURCE_LABELS = { explicit: "显式参数", system: "系统策略", default: "缺省画像" };
+// 参数键 → 中文名（与 STRATEGIES.md 口径一致）；未登记的键回退原始名
+const PARAM_LABELS = {
+  fast: "快线", slow: "慢线", signal: "信号线", window: "通道窗口", std_dev: "标准差倍数",
+  period: "周期", oversold: "超卖", overbought: "超买",
+  vote_threshold: "投票阈值", ma_fast: "MA 快线", ma_slow: "MA 慢线",
+  rsi_period: "RSI 周期", rsi_oversold: "RSI 超卖", rsi_overbought: "RSI 超买",
+  bb_period: "布林周期", bb_std: "布林标准差",
+};
+
+function backtestStrategyLabel(value) {
+  return backtestMeta.strategies.find((item) => item.value === value)?.label ?? value;
+}
+
+function backtestExecutionLabel(value) {
+  return backtestMeta.executions.find((item) => item.value === value)?.label ?? value;
+}
+
+function paramLabel(name) {
+  return PARAM_LABELS[name] ?? name;
+}
+
+function profileSourceLabel(source) {
+  if (!source) return "";
+  if (source.startsWith("config:")) return `配置画像 ${source.slice("config:".length)}`;
+  return PROFILE_SOURCE_LABELS[source] ?? source;
+}
+
+function strategyParamsSchema(value) {
+  return backtestMeta.strategies.find((item) => item.value === value)?.params_schema ?? [];
+}
+
+function populateBacktestFormOptions() {
+  const strategySelect = elements.backtestForm.elements.strategy;
+  const executionSelect = elements.backtestForm.elements.execution;
+  const keepStrategy = strategySelect.value;
+  const keepExecution = executionSelect.value;
+  strategySelect.innerHTML = backtestMeta.strategies
+    .map((item) => `<option value="${escapeHtml(item.value)}"${item.value === keepStrategy ? " selected" : ""}>${escapeHtml(item.label)}</option>`)
+    .join("");
+  executionSelect.innerHTML = backtestMeta.executions
+    .map((item) => `<option value="${escapeHtml(item.value)}"${item.value === keepExecution ? " selected" : ""}>${escapeHtml(item.label)}</option>`)
+    .join("");
+  populateBacktestProfileOptions();
+  renderBacktestParams();
+}
+
+// 画像下拉：system + config 画像名；仅 combo_vote 可用（单策略无画像概念，禁用并清空）
+function populateBacktestProfileOptions() {
+  const select = elements.backtestForm.elements.profile;
+  if (!select) return;
+  const keep = select.value;
+  const options = [{ value: "", label: "缺省解析链" }, ...backtestMeta.profiles];
+  select.innerHTML = options
+    .map((item) => `<option value="${escapeHtml(item.value)}"${item.value === keep ? " selected" : ""}>${escapeHtml(item.label)}</option>`)
+    .join("");
+  syncBacktestProfileState();
+}
+
+function syncBacktestProfileState() {
+  const select = elements.backtestForm.elements.profile;
+  if (!select) return;
+  const isCombo = elements.backtestForm.elements.strategy.value === "combo_vote";
+  select.disabled = !isCombo;
+  if (!isCombo) select.value = "";
+}
+
+// 按所选策略的 params_schema 动态渲染参数输入。留空 = 用画像/缺省链解析（provenance 才诚实），
+// 填写 = 显式覆盖（→ profile_source=explicit）。combo_vote 把 vote_threshold 置顶、三件套折叠。
+function renderBacktestParams() {
+  const container = document.querySelector("#backtest-params");
+  if (!container) return;
+  syncBacktestProfileState();
+  const strategy = elements.backtestForm.elements.strategy.value;
+  const schema = strategyParamsSchema(strategy);
+  if (!schema.length) {
+    container.innerHTML = "";
+    container.hidden = true;
+    return;
+  }
+  container.hidden = false;
+  const field = (f) => `
+    <label class="bt-param">
+      <span>${escapeHtml(paramLabel(f.name))}</span>
+      <input type="number" data-param="${escapeHtml(f.name)}" inputmode="decimal"
+        placeholder="默认 ${escapeHtml(String(f.default))}"
+        ${f.min !== undefined ? `min="${escapeHtml(String(f.min))}"` : ""}
+        ${f.max !== undefined ? `max="${escapeHtml(String(f.max))}"` : ""}
+        step="${f.type === "int" ? "1" : "any"}">
+    </label>`;
+  if (strategy === "combo_vote") {
+    const threshold = schema.filter((f) => f.name === "vote_threshold");
+    const advanced = schema.filter((f) => f.name !== "vote_threshold");
+    container.innerHTML = `
+      <div class="bt-param-row">${threshold.map(field).join("")}</div>
+      <details class="bt-param-advanced">
+        <summary>高级参数（可选 · MA/RSI/布林带三件套）</summary>
+        <div class="bt-param-row">${advanced.map(field).join("")}</div>
+      </details>`;
+  } else {
+    container.innerHTML = `<div class="bt-param-row">${schema.map(field).join("")}</div>`;
+  }
+}
+
+// 收集用户实际填写的参数（留空跳过）；全空 → null，让后端走画像/缺省链而非误判 explicit
+function collectBacktestParams() {
+  const params = {};
+  document.querySelectorAll("#backtest-params [data-param]").forEach((input) => {
+    const raw = input.value.trim();
+    if (raw === "") return;
+    const num = Number(raw);
+    params[input.dataset.param] = Number.isNaN(num) ? raw : num;
+  });
+  return Object.keys(params).length ? params : null;
+}
+
+async function fetchBacktestOptions() {
+  try {
+    const payload = await apiRequest("/api/meta/backtest-options");
+    if (payload.strategies?.length) backtestMeta.strategies = payload.strategies;
+    if (payload.executions?.length) backtestMeta.executions = payload.executions;
+    if (payload.profiles?.length) backtestMeta.profiles = payload.profiles;
+  } catch {
+    // 元数据接口失败时保留兜底选项，不打断页面
+  }
+  populateBacktestFormOptions();
+}
 const AUTO_REFRESH_INTERVALS = { 60: 60000, 300: 300000 };
 
 function escapeHtml(value) {
@@ -144,7 +279,10 @@ function formatPercent(value, digits = 2, signed = false) {
 }
 
 function recClass(value) {
-  return value === "BUY" ? "rec-buy" : value === "SELL" ? "rec-sell" : "rec-hold";
+  if (value === "BUY") return "rec-buy";
+  if (value === "SELL") return "rec-sell";
+  if (value === "CONFLICT") return "rec-conflict";
+  return "rec-hold";
 }
 
 function shortDate(value) {
@@ -928,13 +1066,14 @@ function renderMarket() {
 
   const recommendation = document.querySelector("#recommendation");
   recommendation.className = recClass(market.recommendation);
-  recommendation.textContent = recommendationLabels[market.recommendation];
-  document.querySelector("#confidence").textContent = `方向一致度 ${market.confidence}%`;
+  recommendation.textContent = recommendationLabels[market.recommendation] ?? market.recommendation;
+  // vote_ratio 是规则票占比（非概率）；文案与 title 都明确标注，避免被误读成胜率
+  document.querySelector("#vote-ratio").textContent = `规则票占比 ${market.vote_ratio}%（非概率）`;
   document.querySelector("#decision-reason").textContent = market.reason;
 
-  const voteNames = { ma: "均线趋势", rsi: "RSI 区间", bollinger: "布林位置" };
+  const voteNames = { ma: "均线趋势", rsi: "RSI 区间", bollinger: "布林位置", macd: "MACD 状态", trend: "均线排列", donchian: "唐奇安通道" };
   document.querySelector("#vote-grid").innerHTML = Object.entries(market.votes).map(([name, vote]) => `
-    <div class="vote-item"><span>${voteNames[name]}</span><strong class="${recClass(vote)}">${voteLabels[vote]}</strong></div>
+    <div class="vote-item"><span>${voteNames[name] ?? name}</span><strong class="${recClass(vote)}">${voteLabels[vote] ?? vote}</strong></div>
   `).join("");
 
   const indicators = market.indicators;
@@ -1023,11 +1162,15 @@ function renderBacktests() {
       <td>${escapeHtml(item.total_trades ?? 0)}</td>
       <td>${escapeHtml(item.created_at || "--")}</td>
       <td><div class="strategy-actions">
+        <button class="table-action" data-replay-backtest="${item.id}" title="查看此记录保存的权益曲线与成交明细">回放</button>
         <button class="table-action" data-rerun-backtest="${item.id}" title="按此记录参数重新执行回测">重跑</button>
         <button class="table-action is-danger" data-delete-backtest="${item.id}" title="删除此回测记录">删除</button>
       </div></td>
     </tr>
   `).join("");
+  body.querySelectorAll("[data-replay-backtest]").forEach((button) => {
+    button.addEventListener("click", () => replayBacktest(Number(button.dataset.replayBacktest)));
+  });
   body.querySelectorAll("[data-rerun-backtest]").forEach((button) => {
     button.addEventListener("click", () => rerunBacktest(Number(button.dataset.rerunBacktest)));
   });
@@ -1036,12 +1179,28 @@ function renderBacktests() {
   });
 }
 
+async function replayBacktest(id) {
+  elements.backtestError.hidden = true;
+  try {
+    const response = await apiRequest(`/api/backtests/${id}`);
+    state.backtest = response.data;
+    state.backtestHover = null;
+    renderBacktestResult();
+    elements.backtestResult.scrollIntoView({ behavior: "smooth", block: "start" });
+  } catch (error) {
+    showToast(error.message, "error");
+  }
+}
+
 function rerunBacktest(id) {
   const record = state.backtests.find((item) => item.id === id);
   if (!record) return;
   const fields = elements.backtestForm.elements;
   fields.symbol.value = record.symbol;
   fields.strategy.value = record.strategy_key;
+  // A5：策略键变了 → 重渲染参数输入，避免把上一个策略的参数键提交上去（白名单 422）。
+  // 参数/画像不做精确还原（列表行不含完整 strategy_params），rerun 按缺省链解析。
+  renderBacktestParams();
   fields.bars.value = record.bar_count;
   fields.execution.value = record.execution;
   elements.backtestForm.requestSubmit();
@@ -1072,6 +1231,11 @@ async function runBacktest(event) {
       execution: fields.execution.value,
       benchmark: fields.benchmark.checked,
     };
+    // A5：仅在用户实际填写时附带 params/profile（留空 → 后端走画像/缺省链，provenance 才诚实）
+    const explicitParams = collectBacktestParams();
+    if (explicitParams) payload.params = explicitParams;
+    const profileValue = fields.profile ? fields.profile.value : "";
+    if (fields.strategy.value === "combo_vote" && profileValue) payload.profile = profileValue;
     const response = await apiRequest("/api/backtest", {
       method: "POST",
       body: JSON.stringify(payload),
@@ -1098,8 +1262,27 @@ function renderBacktestResult() {
   const data = state.backtest;
   if (!data) return;
   elements.backtestResult.hidden = false;
-  document.querySelector("#backtest-result-title").textContent = `${data.symbol} · ${backtestStrategyLabels[data.strategy] ?? data.strategy}`;
-  document.querySelector("#backtest-result-meta").textContent = `${backtestExecutionLabels[data.execution] ?? data.execution} · ${data.bar_count} 根 K 线`;
+  document.querySelector("#backtest-result-title").textContent = `${data.symbol} · ${backtestStrategyLabel(data.strategy)}`;
+  document.querySelector("#backtest-result-meta").textContent = `${backtestExecutionLabel(data.execution)} · ${data.bar_count} 根 K 线`;
+
+  // A5 provenance：参数来源 + 实际生效参数摘要（combo 显示阈值+组件，单策略显示扁平参数）
+  const provenance = document.querySelector("#backtest-provenance");
+  if (provenance) {
+    const parts = [];
+    if (data.profile_source) parts.push(`参数来源：${profileSourceLabel(data.profile_source)}`);
+    const sp = data.strategy_params;
+    if (sp && typeof sp === "object") {
+      if (sp.vote_threshold !== undefined) {
+        const comps = sp.components && typeof sp.components === "object" ? Object.keys(sp.components).join("/") : "";
+        parts.push(`投票阈值 ${sp.vote_threshold}${comps ? ` · 组件 ${comps}` : ""}`);
+      } else {
+        const flat = Object.entries(sp).map(([key, val]) => `${paramLabel(key)}=${val}`).join(" · ");
+        if (flat) parts.push(flat);
+      }
+    }
+    provenance.textContent = parts.join("　|　");
+    provenance.hidden = parts.length === 0;
+  }
 
   // 基准图例：仅在请求了基准且数据可用时展示（return 为小数口径，用 formatPercent）
   const benchmark = data.benchmark;
@@ -1608,6 +1791,8 @@ document.addEventListener("visibilitychange", () => {
   syncAutoRefreshTimer();
 });
 elements.backtestForm.addEventListener("submit", runBacktest);
+// A5：切换策略 → 按新策略的 params_schema 重渲染参数输入，并同步画像下拉可用态
+elements.backtestForm.elements.strategy.addEventListener("change", renderBacktestParams);
 elements.detailBacktest.addEventListener("click", runDetailBacktest);
 elements.syncStocks.addEventListener("click", syncStockCatalog);
 elements.refreshQuotes.addEventListener("click", refreshStockQuotes);
@@ -1658,6 +1843,15 @@ elements.stockPageNext.addEventListener("click", () => {
   renderStockCatalog();
 });
 elements.accountButton.addEventListener("click", () => openAuth("login"));
+document.querySelector("#gate-public-button").addEventListener("click", async () => {
+  if (state.selectedSymbol) {
+    await switchView("detail");
+    return;
+  }
+  const firstMarket = marketsForAsset()[0];
+  if (firstMarket) await selectSymbol(firstMarket.symbol);
+  else await switchView("stocks");
+});
 document.querySelector("#logout-button").addEventListener("click", async () => {
   await apiRequest("/api/auth/logout", { method: "POST" });
   state.user = null;
@@ -1668,6 +1862,12 @@ document.querySelector("#logout-button").addEventListener("click", async () => {
   state.selectedStrategyId = "";
   state.appliedStrategyId = "";
   await fetchDashboard();
+  // 退出后与游客首屏口径一致：停在详情页但已无可用标的时，回退到公开数据
+  if (state.view === "detail" && !state.currentMarket) {
+    const firstMarket = marketsForAsset()[0];
+    if (firstMarket) await selectSymbol(firstMarket.symbol);
+    else await switchView("stocks");
+  }
 });
 elements.addStockButton.addEventListener("click", () => {
   elements.stockError.hidden = true;
@@ -1777,11 +1977,11 @@ elements.strategyForm.addEventListener("submit", async (event) => {
     elements.strategyError.hidden = false;
   }
 });
-elements.chart.addEventListener("mousemove", (event) => {
+function hoverChartAt(clientX) {
   const geometry = state.chartGeometry;
   if (!geometry) return;
   const rect = elements.chart.getBoundingClientRect();
-  const x = event.clientX - rect.left;
+  const x = clientX - rect.left;
   const index = Math.max(0, Math.min(geometry.bars.length - 1, Math.floor((x - geometry.margin.left) / geometry.candleStep)));
   state.hoverIndex = index;
   const bar = geometry.bars[index];
@@ -1790,17 +1990,19 @@ elements.chart.addEventListener("mousemove", (event) => {
   elements.chartTooltip.style.top = "18px";
   elements.chartTooltip.innerHTML = `${escapeHtml(bar.date)}<br>开 ${formatNumber(bar.open)}　高 ${formatNumber(bar.high)}<br>低 ${formatNumber(bar.low)}　收 ${formatNumber(bar.close)}<br>量 ${formatNumber(bar.volume, 0)}`;
   drawChart();
-});
-elements.chart.addEventListener("mouseleave", () => {
+}
+
+function clearChartHover() {
   state.hoverIndex = null;
   elements.chartTooltip.hidden = true;
   drawChart();
-});
-elements.backtestChart.addEventListener("mousemove", (event) => {
+}
+
+function hoverEquityAt(clientX) {
   const geometry = state.backtestChartGeometry;
   if (!geometry || !geometry.curve.length) return;
   const rect = elements.backtestChart.getBoundingClientRect();
-  const x = event.clientX - rect.left;
+  const x = clientX - rect.left;
   const ratio = geometry.curve.length <= 1 ? 0.5 : (x - geometry.margin.left) / geometry.chartWidth;
   const index = Math.max(0, Math.min(geometry.curve.length - 1, Math.round(ratio * (geometry.curve.length - 1))));
   state.backtestHover = index;
@@ -1812,12 +2014,33 @@ elements.backtestChart.addEventListener("mousemove", (event) => {
   elements.backtestChartTooltip.style.top = "18px";
   elements.backtestChartTooltip.innerHTML = `${escapeHtml(point.date)}<br>净值 ${formatNumber(point.equity)}<br>区间收益 ${changePct >= 0 ? "+" : ""}${formatNumber(changePct)}%`;
   drawEquityChart();
-});
-elements.backtestChart.addEventListener("mouseleave", () => {
+}
+
+function clearEquityHover() {
   state.backtestHover = null;
   elements.backtestChartTooltip.hidden = true;
   drawEquityChart();
-});
+}
+
+function bindChartPointerEvents(canvas, onMove, onClear) {
+  canvas.addEventListener("mousemove", (event) => onMove(event.clientX));
+  canvas.addEventListener("mouseleave", onClear);
+  // 触屏：单指按住拖动即显示十字光标与提示，抬手隐藏（与主流行情 App 一致）；
+  // preventDefault + CSS touch-action:none 阻止拖动图表时页面跟随滚动
+  canvas.addEventListener("touchstart", (event) => {
+    event.preventDefault();
+    if (event.touches.length) onMove(event.touches[0].clientX);
+  }, { passive: false });
+  canvas.addEventListener("touchmove", (event) => {
+    event.preventDefault();
+    if (event.touches.length) onMove(event.touches[0].clientX);
+  }, { passive: false });
+  canvas.addEventListener("touchend", onClear);
+  canvas.addEventListener("touchcancel", onClear);
+}
+
+bindChartPointerEvents(elements.chart, hoverChartAt, clearChartHover);
+bindChartPointerEvents(elements.backtestChart, hoverEquityAt, clearEquityHover);
 
 new ResizeObserver(() => {
   if (state.view === "detail") drawChart();
@@ -1831,8 +2054,17 @@ async function bootstrap() {
   try {
     await fetchCurrentUser();
     await fetchDashboard();
-    if (state.user) await loadProtectedData();
-    if (state.user) await fetchMarketOverview();
+    await fetchBacktestOptions();
+    if (state.user) {
+      await loadProtectedData();
+      await fetchMarketOverview();
+    } else {
+      // 游客首屏直接落到公开数据：优先观察池详情（/api/dashboard、/api/markets 均匿名可用），
+      // 无行情时退到全部数据目录；注册墙只保留在市场总览/策略/回测等账号功能上
+      const firstMarket = marketsForAsset()[0];
+      if (firstMarket) await selectSymbol(firstMarket.symbol);
+      else await switchView("stocks");
+    }
   } catch (error) {
     elements.generatedAt.textContent = "连接失败";
     elements.dataAlert.hidden = false;

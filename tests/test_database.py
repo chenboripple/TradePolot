@@ -371,5 +371,273 @@ class DatabaseInitializationTest(unittest.TestCase):
             self.assertEqual(item["price_kind"], "daily")
 
 
+class SchemaV12MigrationTest(unittest.TestCase):
+    """v12（A8 落库溯源 + A9 复权溯源）迁移与幂等。"""
+
+    # v11 时代 backtest_results / daily_bars 的列集（不含 v12 新列），
+    # 用于构造"旧库"再断言只补齐 v12 增量列。
+    V11_BACKTEST_COLS = (
+        "id INTEGER PRIMARY KEY, symbol TEXT, name TEXT, start_date TEXT, "
+        "end_date TEXT, initial_capital REAL, final_capital REAL, "
+        "total_return REAL, annual_return REAL, max_drawdown REAL, "
+        "sharpe_ratio REAL, total_trades INTEGER, win_rate REAL, "
+        "created_at TIMESTAMP, user_id INTEGER, strategy_id INTEGER, "
+        "strategy_key TEXT, bar_count INTEGER, execution TEXT, result_json TEXT"
+    )
+    V11_DAILY_COLS = (
+        "id INTEGER PRIMARY KEY, symbol TEXT, trade_date TEXT, open REAL, "
+        "high REAL, low REAL, close REAL, pre_close REAL, change REAL, "
+        "pct_chg REAL, volume REAL, amount REAL, source TEXT, updated_at TIMESTAMP"
+    )
+
+    def _columns(self, target, table):
+        with sqlite3.connect(target) as connection:
+            return {row[1] for row in connection.execute(f"PRAGMA table_info({table})")}
+
+    def test_fresh_db_has_v12_columns(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target = Path(temp_dir) / "fresh.db"
+            init_database(target)
+            self.assertTrue(
+                {"run_kind", "params_json", "profile_source", "report_json"}.issubset(
+                    self._columns(target, "backtest_results")
+                )
+            )
+            self.assertTrue(
+                {"adjust", "adj_anchor_date", "data_version"}.issubset(
+                    self._columns(target, "daily_bars")
+                )
+            )
+
+    def test_legacy_db_upgrades_to_v12(self):
+        # 本地库实际停在 v10，CI/新库为 v11；_ensure_columns 与起始版本无关，
+        # 两者都应补齐 v12 增量列并把 user_version 推到 12。
+        for legacy_version in (10, 11):
+            with self.subTest(legacy_version=legacy_version):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    target = Path(temp_dir) / f"legacy-v{legacy_version}.db"
+                    with sqlite3.connect(target) as connection:
+                        connection.execute(
+                            f"CREATE TABLE backtest_results ({self.V11_BACKTEST_COLS})"
+                        )
+                        connection.execute(
+                            f"CREATE TABLE daily_bars ({self.V11_DAILY_COLS})"
+                        )
+                        connection.execute(f"PRAGMA user_version={legacy_version}")
+
+                    before_bt = self._columns(target, "backtest_results")
+                    before_daily = self._columns(target, "daily_bars")
+                    self.assertNotIn("run_kind", before_bt)
+                    self.assertNotIn("adjust", before_daily)
+
+                    init_database(target)
+
+                    after_bt = self._columns(target, "backtest_results")
+                    after_daily = self._columns(target, "daily_bars")
+                    # 既有列保留，v12 增量列补齐
+                    self.assertTrue(before_bt.issubset(after_bt))
+                    self.assertTrue(before_daily.issubset(after_daily))
+                    self.assertTrue(
+                        {
+                            "run_kind",
+                            "params_json",
+                            "profile_source",
+                            "report_json",
+                        }.issubset(after_bt)
+                    )
+                    self.assertTrue(
+                        {"adjust", "adj_anchor_date", "data_version"}.issubset(
+                            after_daily
+                        )
+                    )
+                    with sqlite3.connect(target) as connection:
+                        version = connection.execute("PRAGMA user_version").fetchone()[0]
+                    self.assertEqual(version, DATABASE_SCHEMA_VERSION)
+
+    def test_init_database_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target = Path(temp_dir) / "idem.db"
+            init_database(target)
+            init_database(target)  # 第二次不得抛错或重复加列
+            self.assertTrue(
+                {"run_kind", "report_json"}.issubset(
+                    self._columns(target, "backtest_results")
+                )
+            )
+            self.assertTrue(
+                {"adjust", "data_version"}.issubset(self._columns(target, "daily_bars"))
+            )
+
+    def test_daily_bars_persist_adjustment_metadata(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target = Path(temp_dir) / "adjust.db"
+            row = {
+                "trade_date": "20260831",
+                "open": 10,
+                "high": 11,
+                "low": 9,
+                "close": 10.5,
+                "pre_close": 10.2,
+                "change": 0.3,
+                "pct_chg": 2.9412,
+                "vol": 100,
+            }
+            upsert_daily_bars(
+                "600000.SH",
+                [row],
+                "tushare",
+                target,
+                adjust="qfq",
+                adj_anchor_date="20260831",
+                data_version="tushare|20260831|20260901T000000Z",
+            )
+            rows = load_daily_bars("600000.SH", target)
+            self.assertEqual(rows[0]["adjust"], "qfq")
+            self.assertEqual(rows[0]["adj_anchor_date"], "20260831")
+            self.assertEqual(
+                rows[0]["data_version"], "tushare|20260831|20260901T000000Z"
+            )
+
+            # 重新刷新（如检测到复权基准漂移后全量重拉）应覆盖溯源列
+            upsert_daily_bars(
+                "600000.SH",
+                [{**row, "close": 9.45}],
+                "tushare",
+                target,
+                adjust="qfq",
+                adj_anchor_date="20260901",
+                data_version="tushare|20260901|20260902T000000Z",
+            )
+            rows = load_daily_bars("600000.SH", target)
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["close"], 9.45)
+            self.assertEqual(rows[0]["adj_anchor_date"], "20260901")
+            self.assertEqual(
+                rows[0]["data_version"], "tushare|20260901|20260902T000000Z"
+            )
+
+    def test_upsert_daily_bars_defaults_adjust_to_qfq(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target = Path(temp_dir) / "default.db"
+            upsert_daily_bars(
+                "600000.SH",
+                [
+                    {
+                        "trade_date": "20260831",
+                        "open": 10,
+                        "high": 11,
+                        "low": 9,
+                        "close": 10.5,
+                        "vol": 100,
+                    }
+                ],
+                "test",
+                target,
+            )
+            rows = load_daily_bars("600000.SH", target)
+            self.assertEqual(rows[0]["adjust"], "qfq")
+            self.assertEqual(rows[0]["adj_anchor_date"], "")
+            self.assertEqual(rows[0]["data_version"], "")
+
+
+class SchemaV13MigrationTest(unittest.TestCase):
+    """v13（B2 信号台账 + kv_store）迁移与幂等。"""
+
+    LEDGER_COLS = {
+        "id", "symbol", "trade_date", "source", "provisional", "recommendation",
+        "buy_count", "sell_count", "components_json", "model_id", "p_win",
+        "expected_ret", "downside_mae", "entry_price", "exit_price", "horizon",
+        "fwd_net_return", "fwd_ret_aux", "fwd_mae", "label_status",
+        "data_version", "backtest_id", "filled_at", "created_at",
+    }
+
+    def _tables(self, target):
+        with sqlite3.connect(target) as connection:
+            return {
+                row[0]
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )
+            }
+
+    def _columns(self, target, table):
+        with sqlite3.connect(target) as connection:
+            return {row[1] for row in connection.execute(f"PRAGMA table_info({table})")}
+
+    def test_fresh_db_has_ledger_and_kv_store(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target = Path(temp_dir) / "fresh13.db"
+            init_database(target)
+            tables = self._tables(target)
+            self.assertIn("signal_ledger", tables)
+            self.assertIn("kv_store", tables)
+            self.assertTrue(self.LEDGER_COLS.issubset(self._columns(target, "signal_ledger")))
+            self.assertTrue(
+                {"key", "value", "updated_at"}.issubset(self._columns(target, "kv_store"))
+            )
+            with sqlite3.connect(target) as connection:
+                version = connection.execute("PRAGMA user_version").fetchone()[0]
+            self.assertEqual(version, DATABASE_SCHEMA_VERSION)
+            self.assertEqual(version, 13)
+
+    def test_legacy_v12_db_upgrades_to_v13(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target = Path(temp_dir) / "legacy-v12.db"
+            # 构造一个只有 v12 表、无 signal_ledger/kv_store 的旧库
+            init_database(target)
+            with sqlite3.connect(target) as connection:
+                connection.execute("DROP TABLE signal_ledger")
+                connection.execute("DROP TABLE kv_store")
+                connection.execute("PRAGMA user_version=12")
+            self.assertNotIn("signal_ledger", self._tables(target))
+
+            init_database(target)  # 重新初始化应补建 v13 表
+
+            tables = self._tables(target)
+            self.assertIn("signal_ledger", tables)
+            self.assertIn("kv_store", tables)
+            self.assertTrue(self.LEDGER_COLS.issubset(self._columns(target, "signal_ledger")))
+            with sqlite3.connect(target) as connection:
+                version = connection.execute("PRAGMA user_version").fetchone()[0]
+            self.assertEqual(version, 13)
+
+    def test_init_database_idempotent_for_v13(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target = Path(temp_dir) / "idem13.db"
+            init_database(target)
+            init_database(target)  # 第二次不得抛错或重复建表
+            self.assertIn("signal_ledger", self._tables(target))
+            self.assertIn("kv_store", self._tables(target))
+
+    def test_ledger_unique_constraint_present(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target = Path(temp_dir) / "uniq.db"
+            init_database(target)
+            with sqlite3.connect(target) as connection:
+                # 表级 UNIQUE 建的是 sqlite_autoindex（sql 为 NULL），须经 index_list/info 查
+                index_list = connection.execute(
+                    "PRAGMA index_list(signal_ledger)"
+                ).fetchall()
+                unique_column_sets = []
+                for entry in index_list:
+                    name, is_unique, origin = entry[1], entry[2], entry[3]
+                    if not is_unique:
+                        continue
+                    cols = {
+                        row[2]
+                        for row in connection.execute(f"PRAGMA index_info({name})")
+                    }
+                    unique_column_sets.append((origin, cols))
+            # UNIQUE(symbol, trade_date, source, provisional) → origin='u' 的唯一索引
+            self.assertTrue(
+                any(
+                    origin == "u"
+                    and {"symbol", "trade_date", "source", "provisional"}.issubset(cols)
+                    for origin, cols in unique_column_sets
+                ),
+                f"未见 (symbol, trade_date, source, provisional) 唯一约束：{unique_column_sets}",
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

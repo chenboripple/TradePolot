@@ -65,9 +65,12 @@ tradepilot init  # 创建 ~/.tradepilot/config.yaml
 tushare:
   token: "your_token"
 
-feishu:
-  webhook_url: "https://open.feishu.cn/..."
-  webhook_secret: "your_secret"
+# 飞书通知（配好 webhook 即生效；旧的顶层 feishu.webhook_url 结构仍兼容）
+notifiers:
+  feishu:
+    enabled: true
+    webhook: "https://open.feishu.cn/..."
+    secret: "your_secret"
 ```
 
 ## 使用方法
@@ -92,6 +95,9 @@ tradepilot monitor 002022.SZ
 
 # 筛选股票
 tradepilot screen 002022.SZ
+
+# 启动 Web 监控台（浏览器访问 http://127.0.0.1:8000）
+tradepilot serve
 ```
 
 ### Python API
@@ -162,7 +168,14 @@ cp .env.example .env
 
 ## 交易监控台
 
-API 服务启动后访问 `http://localhost:8000`。监控台提供：
+本地启动 API 服务（无需 Docker）：
+
+```bash
+tradepilot serve          # 默认 127.0.0.1:8000
+tradepilot serve --host 0.0.0.0 --port 8000   # 远程访问
+```
+
+Docker 部署则由 `./scripts/docker-deploy.sh local` 启动。服务运行后访问 `http://localhost:8000`。监控台提供：
 
 - 股票与期货独立观察池和市场统计
 - K 线、均线、布林带、成交量及方向变化

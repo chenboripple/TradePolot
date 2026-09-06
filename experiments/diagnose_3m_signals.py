@@ -95,9 +95,9 @@ def main():
                 sell_days.append((b.timestamp.date(), sells))
         print(f"满足阈值2的买入日: {len(buy_days)}  卖出日: {len(sell_days)}  冲突日: {len(conflict_days)}")
         for d, src in buy_days[:10]:
-            print(f"  🟢 {d} <- {src}")
+            print(f"  🔴 {d} <- {src}")  # A 股口径：红=买
         for d, src in sell_days[:10]:
-            print(f"  🔴 {d} <- {src}")
+            print(f"  🟢 {d} <- {src}")
         for d, bs, ss in conflict_days[:10]:
             print(f"  🟡 {d} 冲突 buy={bs} sell={ss}")
 

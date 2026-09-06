@@ -12,15 +12,17 @@
 import math
 import unittest
 from datetime import datetime, timedelta
+from itertools import product
 from typing import Dict, List
 
-from ripple_tradePilot.backtest.report import Metrics
+from ripple_tradePilot.backtest.engine import run_backtest
+from ripple_tradePilot.backtest.report import Metrics, compute_metrics
 from ripple_tradePilot.backtest.walkforward import (
     WalkForwardReport,
     WalkForwardSplit,
     walk_forward,
 )
-from ripple_tradePilot.models.types import Bar, Signal
+from ripple_tradePilot.models.types import Bar, Signal, Side
 from ripple_tradePilot.strategies.base import Strategy
 from ripple_tradePilot.strategies.moving_average import MovingAverageCross
 
@@ -54,13 +56,27 @@ def ma_factory(params: dict) -> Strategy:
 
 
 class RecordingMACross(Strategy):
-    """记录自己实际看到的每根 bar，用于检查信息泄漏。"""
+    """记录自己实际看到的每根 bar，用于检查信息泄漏。
+
+    区分两条路径（A6 warmup 语义）：
+    - ``seen``：评估窗内 ``on_bar`` 看到的 bar（由 run_backtest 调用，进权益曲线）；
+    - ``warmup_seen``：预热前缀看到的 bar（由 ``warmup`` 调用，只推进指标状态、不进权益）。
+
+    ``warmup`` 被刻意覆写为只喂 ``_inner.on_bar``、记到 ``warmup_seen``，这样
+    ``seen`` 始终精确等于评估窗，可与 split 的 train/test 区间逐根比对。
+    """
 
     name = "recording_ma_cross"
 
     def __init__(self, fast: int, slow: int):
         self._inner = MovingAverageCross(fast=fast, slow=slow)
         self.seen: List[datetime] = []
+        self.warmup_seen: List[datetime] = []
+
+    def warmup(self, history) -> None:
+        for bar in history:
+            self.warmup_seen.append(bar.timestamp)
+            self._inner.on_bar(bar)
 
     def on_bar(self, bar: Bar) -> Signal:
         self.seen.append(bar.timestamp)
@@ -130,6 +146,8 @@ class WalkForwardPartitionTest(unittest.TestCase):
         n_oos_instances = 0
         for strategy in created:
             self.assertGreater(len(strategy.seen), 0)
+            # warmup_bars=0（默认）：绝不预热，warmup_seen 必为空 → 与旧版逐根一致
+            self.assertEqual(strategy.warmup_seen, [])
             indices = [ts_to_index[ts] for ts in strategy.seen]
             # 看到的是一段连续区间，中间没有跳变
             self.assertEqual(indices, list(range(indices[0], indices[0] + len(indices))))
@@ -147,6 +165,126 @@ class WalkForwardPartitionTest(unittest.TestCase):
 
         # 每个 split 恰好有一个实例只跑样本外段
         self.assertEqual(n_oos_instances, 3)
+
+
+class WalkForwardWarmupTest(unittest.TestCase):
+    """A6：warmup 预热前缀合法性 + 消除冷启动哑区的语义验证。"""
+
+    def setUp(self):
+        self.bars = make_bars(120)
+        self.ts_to_index = {bar.timestamp: i for i, bar in enumerate(self.bars)}
+
+    def _recording_factory(self, created: List[RecordingMACross]):
+        def factory(params: dict) -> Strategy:
+            strategy = RecordingMACross(fast=params["fast"], slow=params["slow"])
+            created.append(strategy)
+            return strategy
+        return factory
+
+    def test_warmup_prefix_legal_and_eval_window_exact(self):
+        """每实例 = 合法预热前缀（长度≤warmup、紧邻窗口前、时间严格更早）+ 恰好评估窗。"""
+        warmup = 10
+        created: List[RecordingMACross] = []
+        report = walk_forward(
+            self._recording_factory(created), self.bars, PARAM_GRID,
+            n_splits=3, warmup_bars=warmup,
+        )
+
+        n_oos = 0
+        for strategy in created:
+            # 评估窗 seen：连续区间，恰好等于某 split 的 train 或 test 窗
+            self.assertGreater(len(strategy.seen), 0)
+            idx = [self.ts_to_index[ts] for ts in strategy.seen]
+            self.assertEqual(idx, list(range(idx[0], idx[0] + len(idx))))
+            kind = None
+            for split in report.splits:
+                if idx[0] == split.train_start and idx[-1] == split.train_end - 1:
+                    kind, matched = "train", split
+                    break
+                if idx[0] == split.test_start and idx[-1] == split.test_end - 1:
+                    kind, matched = "test", split
+                    n_oos += 1
+                    break
+            self.assertIsNotNone(kind, f"非法评估窗 {idx[0]}..{idx[-1]}")
+
+            # 预热前缀 warmup_seen：长度 ≤ warmup，右端点 == 窗口首根前一根，时间戳严格早于窗口
+            window_start = idx[0]
+            w_idx = [self.ts_to_index[ts] for ts in strategy.warmup_seen]
+            self.assertLessEqual(len(w_idx), warmup)
+            if w_idx:
+                self.assertEqual(w_idx, list(range(w_idx[0], w_idx[0] + len(w_idx))))
+                self.assertEqual(w_idx[-1], window_start - 1)
+                self.assertTrue(
+                    all(ts < self.bars[window_start].timestamp for ts in strategy.warmup_seen)
+                )
+                if kind == "test":
+                    # OOS 前缀严格落在训练窗内（只用过去数据，无前瞻泄漏）
+                    self.assertGreaterEqual(w_idx[0], matched.train_start)
+                    self.assertLessEqual(w_idx[-1], matched.train_end - 1)
+        self.assertEqual(n_oos, 3)
+
+    def test_split_warmup_start_within_train_window(self):
+        """WalkForwardSplit.warmup_start：OOS 预热起点夹在训练窗内，前缀长度 ≤ warmup。"""
+        warmup = 15
+        report = walk_forward(ma_factory, self.bars, PARAM_GRID, n_splits=3, warmup_bars=warmup)
+        for split in report.splits:
+            self.assertGreaterEqual(split.warmup_start, split.train_start)
+            self.assertLessEqual(split.warmup_start, split.test_start)
+            self.assertLessEqual(split.test_start - split.warmup_start, warmup)
+
+    def test_warmup_zero_keeps_empty_prefix(self):
+        """warmup_bars=0：warmup_start == test_start（空前缀），完全等价旧版冷启动。"""
+        report = walk_forward(ma_factory, self.bars, PARAM_GRID, n_splits=3, warmup_bars=0)
+        for split in report.splits:
+            self.assertEqual(split.warmup_start, split.test_start)
+
+    def test_warmup_enables_first_bar_signal(self):
+        """语义验证：warmup≥slow 时评估段首根即可出信号；冷启动前 slow 根必无信号。
+
+        夹具：平价预热段（fast_ma==slow_ma，无信号、_last_side 仍为 None）→ 评估段
+        首根跳涨，使 fast_ma>slow_ma 形成 BUY 交叉。冷启动实例首根 slow 窗未满，必返回
+        None；预热实例窗口已满，首根即捕捉交叉。
+        """
+        fast, slow = 3, 8
+        base = datetime(2026, 1, 5)
+
+        def flat(day: int, price: float) -> Bar:
+            return Bar(timestamp=base + timedelta(days=day), open=price, high=price,
+                       low=price, close=price, volume=1_000_000)
+
+        prefix = [flat(i, 100.0) for i in range(slow + 2)]   # 平价预热，窗口填满
+        eval_bars = [flat(len(prefix) + j, 110.0 if j == 0 else 110.0) for j in range(6)]
+
+        # 冷启动：评估段首根 slow 窗未满 → 无信号
+        cold = MovingAverageCross(fast=fast, slow=slow)
+        self.assertIsNone(cold.on_bar(eval_bars[0]).side)
+
+        # 预热后：窗口已满，首根跳涨 → fast_ma>slow_ma → BUY 交叉
+        warm = MovingAverageCross(fast=fast, slow=slow)
+        warm.warmup(prefix)
+        self.assertEqual(warm.on_bar(eval_bars[0]).side, Side.BUY)
+
+    def test_select_by_return_maximizes_train_return(self):
+        """select_by='return' 选出的参数确为训练期总收益最大者（独立复算交叉核对）。"""
+        warmup = 10
+        report = walk_forward(
+            ma_factory, self.bars, PARAM_GRID, n_splits=3,
+            warmup_bars=warmup, select_by="return",
+        )
+        split = report.splits[0]
+        train_bars = self.bars[split.train_start:split.train_end]
+        train_warmup = self.bars[max(0, split.train_start - warmup):split.train_start]
+
+        def train_return(params: dict) -> float:
+            strategy = ma_factory(dict(params))
+            if train_warmup:
+                strategy.warmup(train_warmup)
+            result = run_backtest(strategy, train_bars)
+            return compute_metrics(result.equity_curve, positions=result.positions).total_return
+
+        combos = [dict(zip(PARAM_GRID.keys(), v)) for v in product(*PARAM_GRID.values())]
+        best = max(train_return(p) for p in combos)
+        self.assertAlmostEqual(train_return(split.best_params), best, places=10)
 
 
 class WalkForwardReportTest(unittest.TestCase):
@@ -215,6 +353,23 @@ class WalkForwardReportTest(unittest.TestCase):
         self.assertEqual(len(report.splits), 3)
         self.assertTrue(math.isfinite(report.overfit_gap))
 
+    def test_selection_uses_held_day_sharpe(self):
+        """A6 口径对齐：select_by='sharpe' 用持仓日夏普选参（== compute_metrics(positions=...)），
+        与 CLI/网页展示同口径，而非旧版全样本夏普。独立复算训练窗各组合核对。"""
+        report = walk_forward(ma_factory, self.bars, PARAM_GRID, n_splits=3, select_by="sharpe")
+        split = report.splits[0]
+        train_bars = self.bars[split.train_start:split.train_end]
+
+        def held_sharpe(params: dict) -> float:
+            result = run_backtest(ma_factory(dict(params)), train_bars)
+            return compute_metrics(result.equity_curve, positions=result.positions).sharpe
+
+        combos = [dict(zip(PARAM_GRID.keys(), v)) for v in product(*PARAM_GRID.values())]
+        best = max(held_sharpe(p) for p in combos)
+        self.assertAlmostEqual(held_sharpe(split.best_params), best, places=10)
+        # is_metrics.sharpe 即持仓日口径，与独立复算逐位一致
+        self.assertAlmostEqual(split.is_metrics.sharpe, held_sharpe(split.best_params), places=10)
+
 
 class WalkForwardValidationTest(unittest.TestCase):
     """非法输入与数据量不足必须显式报错，而不是静默跑出垃圾指标。"""
@@ -235,6 +390,12 @@ class WalkForwardValidationTest(unittest.TestCase):
     def test_insufficient_bars_raise(self):
         with self.assertRaises(ValueError):
             walk_forward(ma_factory, make_bars(5), PARAM_GRID, n_splits=3)
+
+    def test_invalid_warmup_and_select_by_raise(self):
+        with self.assertRaises(ValueError):
+            walk_forward(ma_factory, self.bars, PARAM_GRID, warmup_bars=-1)
+        with self.assertRaises(ValueError):
+            walk_forward(ma_factory, self.bars, PARAM_GRID, select_by="alpha")
 
 
 if __name__ == "__main__":

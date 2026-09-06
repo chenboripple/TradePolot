@@ -39,19 +39,51 @@ tushare:
   token: ""
   rate_limit_delay: 1.5
 
+# 日线数据刷新（A9 复权混接防护）
+data:
+  # 增量刷新回看窗口（天）。前复权序列以"拉取时最新交易日"为锚，上游除权后会整段重算；
+  # 回看窗口太短会把新锚数据接到旧锚存量上造成混接。30 天给 detect_rebase 留足重叠样本。
+  refresh_overlap_days: 30
+  # 检测到复权基准漂移时全量重拉的天数下限（约 3 年）；实际会扩到覆盖全部存量历史。
+  full_refetch_days: 1095
+
 monitor:
   interval_seconds: 300
   # 汇总报告最短间隔（秒）。个股买卖信号不受此限制，触发即推送。
   report_interval_seconds: 3600
   # 是否把 Web 监控台观察池中的股票也纳入监控
   use_watchlist: true
-  bar_freq: "1min"
+  # combo_vote 类策略的全局默认投票阈值（MA/RSI/BB 需几票同向才出信号）。
+  # 监控与看板共用此口径；可被单个 strategy_profile 的 vote_threshold 覆盖。范围 1~3。
+  # 注意：阈值越高信号越少（2 票在震荡市可能数月无信号），越低越接近"任一指标即触发"。
+  vote_threshold: 2
+  # A3 起信号统一在**日线**上评估（库内 qfq 历史 + 当日快照合成 provisional bar），每轮只
+  # 刷新一次全市场快照。旧的 "1min" 已废弃：读到非 daily 值会告警并按日线运行；分钟级即时
+  # 提醒降级为下方可选 price_alert（默认关）。
+  bar_freq: "daily"
+  # 收盘例程触发时刻（HH:MM）：每交易日一次刷新个股日线 → 确认重评 → 收盘通知 → 写信号台账。
+  finalize_after: "15:05"
+  # 收盘例程是否顺带增量刷新行业板块数据（C 阶段；默认关，开启会增加收盘网络调用）。
+  refresh_industry: false
   trading_hours:
     start: "09:30"
     end: "15:00"
+  # 可选价格预警（规则化、非投票信号，默认关）：与个股信号通道分开去重，互不串扰。
+  price_alert:
+    enabled: false
+    pct_threshold: 0.05      # |日内涨跌幅| ≥ 此比例 → 急拉/急跌提醒
+    near_limit_pct: 0.02     # 距涨/跌停 ≤ 此比例 → 逼近涨/跌停提醒（按板块 limit 推导）
+    reference_prices: {}     # symbol → 参考价（上穿触发），如 {"600000.SH": 11.0}
 
 notifiers:
   feishu:
     enabled: false
     webhook: ""
     secret: ""
+    # 可选：监控台地址，附在信号卡片底部，收到信号后可一键跳转看图
+    dashboard_url: ""   # 例如 http://your-host:8000
+
+# 风控提示参数（仅用于在买入信号里估算参考止损/止盈位，与回测引擎同口径；系统只读不下单）
+risk:
+  stop_loss_pct: 0.08     # 止损 8%
+  take_profit_pct: 0.20   # 止盈 20%

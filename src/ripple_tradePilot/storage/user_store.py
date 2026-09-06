@@ -391,16 +391,28 @@ def update_strategy(
     return _strategy_dict(row, user_id)
 
 
-def record_user_backtest(
-    user_id: int,
+def record_backtest_run(
     backtest: Dict[str, Any],
     path: Path | None = None,
+    *,
+    user_id: Optional[int] = None,
+    run_kind: str = "backtest",
+    params_json: Optional[str] = None,
+    profile_source: Optional[str] = None,
+    report_json: Optional[str] = None,
 ) -> int:
-    """把一次 Web 回测结果写入 backtest_results，返回新记录 id。
+    """把一次回测 / walk-forward 结果写入 backtest_results，返回记录 id。
 
-    ``backtest`` 需提供 symbol/name/start_date/end_date 等字段；
-    数值字段缺省时写 0，保证回测记录页始终有可展示的行。
-    strategy_key/bar_count/execution 记录回测入参，供前端按原参数重跑。
+    Web 端传 ``user_id``（用户记录），CLI 端不传（``user_id`` 为 NULL，非用户记录）；
+    ``list_user_backtests`` 按 user_id 过滤，故 NULL 行不进任何用户列表。
+
+    ``backtest`` 字典需提供 symbol/name/start_date/end_date 等字段（含 result_json），
+    数值字段缺省时写 0，保证回测记录页始终有可展示的行；strategy_key/bar_count/execution
+    记录回测入参，供前端按原参数重跑与历史回放。
+
+    A8 溯源列：``run_kind``='backtest'|'walkforward'；``params_json`` 记录入参；
+    ``profile_source`` 记录画像来源（A5：explicit/system/config:名字/default）；
+    walk-forward 的完整分段报告序列化进 ``report_json``。
     """
     target = _target(path)
     with sqlite3.connect(target, timeout=30) as connection:
@@ -410,8 +422,12 @@ def record_user_backtest(
                 user_id, symbol, name, start_date, end_date,
                 initial_capital, final_capital, total_return, annual_return,
                 max_drawdown, sharpe_ratio, total_trades, win_rate,
-                created_at, strategy_id, strategy_key, bar_count, execution
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?, ?, ?)
+                created_at, strategy_id, strategy_key, bar_count, execution, result_json,
+                run_kind, params_json, profile_source, report_json
+            ) VALUES (
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP,
+                ?, ?, ?, ?, ?, ?, ?, ?, ?
+            )
             """,
             (
                 user_id,
@@ -431,9 +447,78 @@ def record_user_backtest(
                 backtest.get("strategy_key"),
                 backtest.get("bar_count", 0),
                 backtest.get("execution", ""),
+                backtest.get("result_json"),
+                run_kind,
+                params_json,
+                profile_source,
+                report_json,
             ),
         )
         return int(cursor.lastrowid)
+
+
+def list_backtest_runs(
+    path: Path | None = None,
+    *,
+    kind: Optional[str] = None,
+    limit: int = 50,
+) -> List[Dict[str, Any]]:
+    """列出 CLI 回测 / walk-forward 记录（user_id 为 NULL 的运行），按 id 倒序。
+
+    ``kind`` 给定时只返回该 run_kind。供 ``tradepilot backtests list`` 使用；
+    不含 result_json/report_json 大字段，详情按需另取。
+    """
+    target = _target(path)
+    query = """
+        SELECT id, symbol, name, run_kind, strategy_key, start_date, end_date,
+               total_return, annual_return, max_drawdown, sharpe_ratio,
+               total_trades, win_rate, bar_count, execution, profile_source,
+               params_json, created_at
+        FROM backtest_results
+        WHERE user_id IS NULL
+    """
+    params: List[Any] = []
+    if kind:
+        query += " AND run_kind = ?"
+        params.append(kind)
+    query += " ORDER BY id DESC LIMIT ?"
+    params.append(limit)
+    with sqlite3.connect(target, timeout=30) as connection:
+        connection.row_factory = sqlite3.Row
+        rows = connection.execute(query, params).fetchall()
+    return [dict(row) for row in rows]
+
+
+def get_backtest_run(
+    run_id: int, path: Path | None = None
+) -> Dict[str, Any] | None:
+    """按 id 取单条 CLI 运行记录（含 result_json/report_json 大字段）。"""
+    target = _target(path)
+    with sqlite3.connect(target, timeout=30) as connection:
+        connection.row_factory = sqlite3.Row
+        row = connection.execute(
+            "SELECT * FROM backtest_results WHERE id = ?", (run_id,)
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def get_user_backtest(
+    backtest_id: int, user_id: int, path: Path | None = None
+) -> Dict[str, Any] | None:
+    """取单条回测记录（含 result_json）；不存在或属于他人时返回 None。"""
+    target = _target(path)
+    with sqlite3.connect(target, timeout=30) as connection:
+        connection.row_factory = sqlite3.Row
+        row = connection.execute(
+            """
+            SELECT backtest_results.*, strategies.name AS strategy_name
+            FROM backtest_results
+            LEFT JOIN strategies ON strategies.id = backtest_results.strategy_id
+            WHERE backtest_results.id = ? AND backtest_results.user_id = ?
+            """,
+            (backtest_id, user_id),
+        ).fetchone()
+    return dict(row) if row else None
 
 
 def list_user_backtests(

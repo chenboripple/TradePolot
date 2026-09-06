@@ -14,6 +14,7 @@ from typing import Iterable, Optional, Dict, Any
 import pandas as pd
 import requests
 
+from ripple_tradePilot.data.cleaning import reject_price_outliers
 from ripple_tradePilot.models.types import Bar
 
 
@@ -339,7 +340,8 @@ class MXDataLoader:
         加载日线为 Bar 迭代器（兼容回测引擎）
         """
         df = self.get_daily_bars(symbol, start_date, end_date)
-        
+
+        parsed: list = []
         for _, row in df.iterrows():
             try:
                 # 处理 None 值
@@ -348,22 +350,25 @@ class MXDataLoader:
                 low_price = row.get('low')
                 close_price = row.get('close')
                 volume = row.get('vol', 0)
-                
+
                 # 跳过任何价格为 None 的数据
                 if open_price is None or high_price is None or low_price is None or close_price is None:
                     continue
-                
-                yield Bar(
+
+                parsed.append(Bar(
                     timestamp=row['datetime'].to_pydatetime() if hasattr(row['datetime'], 'to_pydatetime') else row['datetime'],
                     open=float(open_price),
                     high=float(high_price),
                     low=float(low_price),
                     close=float(close_price),
                     volume=float(volume) if volume is not None else 0.0,
-                )
+                ))
             except Exception as e:
                 print(f"解析 K 线失败：{row}, 错误：{e}")
                 continue
+
+        # 量纲脏数据防护：妙想自然语言接口偶发返回与真实价相差数量级的价格
+        yield from reject_price_outliers(parsed)
     
     def load_minute_bars(
         self,
@@ -376,20 +381,23 @@ class MXDataLoader:
         加载分钟线为 Bar 迭代器（用于实时监控）
         """
         df = self.get_minute_bars(symbol, start_date, end_date, freq)
-        
+
+        parsed: list = []
         for _, row in df.iterrows():
             try:
-                yield Bar(
+                parsed.append(Bar(
                     timestamp=row['datetime'].to_pydatetime() if hasattr(row['datetime'], 'to_pydatetime') else row['datetime'],
                     open=float(row['open']),
                     high=float(row['high']),
                     low=float(row['low']),
                     close=float(row['close']),
                     volume=float(row.get('vol', 0)),
-                )
+                ))
             except Exception as e:
                 print(f"解析分钟 K 线失败：{row}, 错误：{e}")
                 continue
+
+        yield from reject_price_outliers(parsed)
 
 
 if __name__ == "__main__":

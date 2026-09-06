@@ -8,7 +8,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import List
+from typing import List, Optional, Sequence
 
 import numpy as np
 
@@ -50,8 +50,15 @@ class TradeStats:
 def compute_metrics(
     equity_curve: List[float],
     trading_days_per_year: int = TRADING_DAYS_PER_YEAR,
+    positions: Optional[Sequence[int]] = None,
 ) -> Metrics:
-    """从逐 bar 权益曲线计算收益/回撤/夏普/年化。"""
+    """从逐 bar 权益曲线计算收益/回撤/夏普/年化。
+
+    夏普口径：传入 ``positions``（引擎逐 bar 收盘后的持仓股数）时，只用**持仓日**
+    的收益计算夏普。空仓日的 0 收益会同时稀释均值与波动率，把全样本夏普向 0
+    拉低并混入仓位管理的影响；持仓日口径衡量的是策略"在场内"的每持仓日风险
+    调整收益，便于横向比较信号质量。不传 ``positions`` 时退回全样本口径（向后兼容）。
+    """
     eq = np.array(equity_curve, dtype=float)
     if len(eq) < 2:
         return Metrics(total_return=0.0, max_drawdown=0.0, sharpe=0.0, annual_return=0.0)
@@ -63,8 +70,17 @@ def compute_metrics(
     drawdown = (eq - peak) / peak
     max_drawdown = float(drawdown.min())
 
-    if returns.std() != 0:
-        sharpe = float(returns.mean() / returns.std() * np.sqrt(trading_days_per_year))
+    # 夏普用的收益序列：默认全样本；给了持仓序列则只取持仓日（returns[i] 对应 positions[i]）
+    sharpe_returns = returns
+    if positions is not None:
+        held = np.asarray(list(positions), dtype=float)[: len(returns)] > 0
+        if held.any():
+            sharpe_returns = returns[held]
+
+    if len(sharpe_returns) >= 2 and sharpe_returns.std() != 0:
+        sharpe = float(
+            sharpe_returns.mean() / sharpe_returns.std() * np.sqrt(trading_days_per_year)
+        )
     else:
         sharpe = 0.0
 
