@@ -1289,5 +1289,182 @@ class SchemaV15ModelsTest(unittest.TestCase):
             self.assertIsNone(load_promoted_model("win5", path=target))
 
 
+class CrossVersionSchemaMigrationTest(unittest.TestCase):
+    """跨版本一次性升级：上古库（v0/v10/v11）→ 当前版本，与**全新库逐表逐列对齐**。
+
+    上面各 ``SchemaV1xMigrationTest`` 都是**链式**的（v11→12→13→14→15，每版只验自己那一步）。
+    真实风险是"一台机器上的库停在很久以前的版本，中间跨了好几版"——本地库就曾长期停在 v10，
+    而 ``database_path()`` 还可能解析到某个上古 v0 库（``src/data/`` 下就提交过一份）。
+    本类不假设起始版本，只断言**终态**：跑一次 ``init_database`` 之后，库必须和全新库长得一样
+    （表集、每张表的列集、索引集全等），且老数据一行不少、再跑一次幂等。
+
+    用**全新库当基准（oracle）**而不是把期望列集写死：写死会和 ``CREATE TABLE`` 双份维护、
+    改一处忘一处；而"升级后 ⊇ 全新库"正是用户问的那句"新增字段是不是都会补齐"的形式化。
+    """
+
+    # 终态应有的 17 张表。这里**写死**（不从全新库推）：若某张表的 CREATE 被漏掉，
+    # 全新库和升级库会一起少一张表，靠 oracle 对比就发现不了。
+    EXPECTED_TABLES = {
+        "backtest_results", "daily_bars", "index_daily", "industry_board_bars",
+        "industry_boards", "industry_membership", "kv_store", "market_daily",
+        "ml_datasets", "ml_models", "signal_ledger", "stock_catalog", "stock_quotes",
+        "strategies", "user_sessions", "user_watchlist", "users",
+    }
+
+    # 上古库：只有几张核心表、列集远早于 v12。额外塞一列 ``legacy_only``——
+    # 现行 schema 里没有它，用来钉住"迁移只加列、绝不删列"。
+    ANCIENT_BACKTEST = (
+        "id INTEGER PRIMARY KEY, symbol TEXT, strategy TEXT, total_return REAL, "
+        "created_at TIMESTAMP, legacy_only TEXT"
+    )
+    ANCIENT_DAILY = (
+        "id INTEGER PRIMARY KEY, symbol TEXT, trade_date TEXT, open REAL, high REAL, "
+        "low REAL, close REAL, volume REAL, source TEXT, updated_at TIMESTAMP"
+    )
+    ANCIENT_USERS = "id INTEGER PRIMARY KEY, username TEXT UNIQUE, password_hash TEXT"
+
+    def _tables(self, target):
+        with sqlite3.connect(target) as connection:
+            return {
+                row[0]
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' "
+                    "AND name NOT LIKE 'sqlite_%'"
+                )
+            }
+
+    def _indexes(self, target):
+        with sqlite3.connect(target) as connection:
+            return {
+                row[0]
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type='index' "
+                    "AND name NOT LIKE 'sqlite_%'"
+                )
+            }
+
+    def _column_sets(self, target):
+        return {table: self._columns(target, table) for table in sorted(self._tables(target))}
+
+    def _columns(self, target, table):
+        with sqlite3.connect(target) as connection:
+            return {row[1] for row in connection.execute(f"PRAGMA table_info({table})")}
+
+    def _version(self, target):
+        with sqlite3.connect(target) as connection:
+            return connection.execute("PRAGMA user_version").fetchone()[0]
+
+    def _seed_ancient(self, target, legacy_version):
+        """造一个停在 ``legacy_version`` 的上古库，并写入几行老数据。"""
+        with sqlite3.connect(target) as connection:
+            connection.execute(f"CREATE TABLE backtest_results ({self.ANCIENT_BACKTEST})")
+            connection.execute(f"CREATE TABLE daily_bars ({self.ANCIENT_DAILY})")
+            connection.execute(f"CREATE TABLE users ({self.ANCIENT_USERS})")
+            connection.execute(
+                "INSERT INTO backtest_results (symbol, strategy, total_return, legacy_only) "
+                "VALUES ('600309.SH', 'macross', 0.123, 'keep-me')"
+            )
+            connection.execute(
+                "INSERT INTO daily_bars (symbol, trade_date, open, high, low, close, volume) "
+                "VALUES ('600309.SH', '20260101', 10.0, 10.5, 9.8, 10.2, 1000)"
+            )
+            connection.execute(
+                "INSERT INTO users (username, password_hash) VALUES ('ripple', 'x')"
+            )
+            connection.execute(f"PRAGMA user_version={legacy_version}")
+
+    def _counts(self, target):
+        with sqlite3.connect(target) as connection:
+            return {
+                table: connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                for table in ("backtest_results", "daily_bars", "users")
+            }
+
+    def test_ancient_db_upgrades_to_fresh_schema_in_one_pass(self):
+        # v0 = 从没被 init_database 管过的库（PRAGMA 默认 0）；v10 = 本地库曾长期停留的版本；
+        # v11 = CI/新库在 v12 之前的版本。三者都必须一步补齐到当前版本。
+        for legacy_version in (0, 10, 11):
+            with self.subTest(legacy_version=legacy_version):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    root = Path(temp_dir)
+                    fresh = root / "fresh.db"
+                    init_database(fresh)
+                    oracle_tables = self._tables(fresh)
+                    oracle_columns = self._column_sets(fresh)
+                    oracle_indexes = self._indexes(fresh)
+
+                    target = root / f"ancient-v{legacy_version}.db"
+                    self._seed_ancient(target, legacy_version)
+                    before_counts = self._counts(target)
+                    # 前置确认：升级前确实缺东西（否则这个测试是空跑）
+                    self.assertNotIn("ml_models", self._tables(target))
+                    self.assertNotIn("run_kind", self._columns(target, "backtest_results"))
+
+                    init_database(target)
+
+                    self.assertEqual(self._version(target), DATABASE_SCHEMA_VERSION)
+                    # 表集：既等于写死的 17 张，也等于全新库
+                    self.assertEqual(self._tables(target), self.EXPECTED_TABLES)
+                    self.assertEqual(self._tables(target), oracle_tables)
+                    # 索引集与全新库一致（漏建索引会让老库查询退化，但不报错 → 只能这样钉）
+                    self.assertEqual(self._indexes(target), oracle_indexes)
+                    # 逐表：全新库有的列，升级库**一列不少**
+                    upgraded = self._column_sets(target)
+                    for table, expected in oracle_columns.items():
+                        missing = expected - upgraded[table]
+                        self.assertFalse(missing, f"{table} 缺列 {sorted(missing)}")
+                    # 老数据一行不丢，且 legacy_only 列（现行 schema 没有）保留 → 只加不删
+                    self.assertEqual(self._counts(target), before_counts)
+                    self.assertIn("legacy_only", upgraded["backtest_results"])
+                    with sqlite3.connect(target) as connection:
+                        value = connection.execute(
+                            "SELECT legacy_only FROM backtest_results"
+                        ).fetchone()[0]
+                    self.assertEqual(value, "keep-me")
+
+    def test_upgrade_backfills_columns_added_across_versions(self):
+        # 跨版本新增列的点名抽查（v12 溯源列 + v13 台账 + v15 ML 两表的关键列）：
+        # oracle 对比已覆盖全集，这里再点名一遍，是为了让"哪一版的列没补上"一眼可读。
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target = Path(temp_dir) / "ancient.db"
+            self._seed_ancient(target, 10)
+            init_database(target)
+            expected = {
+                "backtest_results": {"run_kind", "params_json", "profile_source", "report_json"},
+                "daily_bars": {"adjust", "adj_anchor_date", "data_version"},
+                "signal_ledger": {"p_win", "expected_ret", "downside_mae", "label_status"},
+                "ml_datasets": {"dataset_id", "max_trade_date", "feature_columns_json"},
+                "ml_models": {"model_id", "status", "stale", "oos_brier"},
+                "index_daily": {"index_code", "trade_date"},
+                "market_daily": {"up_ratio", "limit_up"},
+                "industry_membership": {"board_code", "as_of"},
+            }
+            for table, columns in expected.items():
+                with self.subTest(table=table):
+                    missing = columns - self._columns(target, table)
+                    self.assertFalse(missing, f"{table} 缺列 {sorted(missing)}")
+
+    def test_repeated_init_database_is_idempotent_after_jump(self):
+        # 跨版本升级后再跑一次：不得抛错、不得改版本号、不得动数据。
+        # monitor/CLI 的每个 DB 访问函数几乎都自带 init_database，所以"跑很多次"是常态。
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target = Path(temp_dir) / "idem-jump.db"
+            self._seed_ancient(target, 0)
+            init_database(target)
+            tables, columns, indexes = (
+                self._tables(target), self._column_sets(target), self._indexes(target)
+            )
+            counts = self._counts(target)
+
+            for _ in range(3):
+                init_database(target)
+
+            self.assertEqual(self._version(target), DATABASE_SCHEMA_VERSION)
+            self.assertEqual(self._tables(target), tables)
+            self.assertEqual(self._column_sets(target), columns)
+            self.assertEqual(self._indexes(target), indexes)
+            self.assertEqual(self._counts(target), counts)
+
+
 if __name__ == "__main__":
     unittest.main()

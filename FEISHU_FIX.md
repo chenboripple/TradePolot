@@ -111,8 +111,8 @@ BB:  20/2.0
 ```bash
 cd /Users/ripple/work\ space/TradePilot
 python3 -c "
-import httpx
-WEBHOOK = 'https://open.feishu.cn/open-apis/bot/v2/hook/859cba37-0ce9-4381-90d4-dc15140af209'
+import httpx, os
+WEBHOOK = os.environ['FEISHU_WEBHOOK_URL']   # 机密走环境变量，别写进文档/提交进仓库
 content = {'msg_type': 'text', 'content': {'text': '测试消息'}}
 r = httpx.post(WEBHOOK, json=content)
 print('✅ 成功' if r.json().get('code') == 0 else '❌ 失败')

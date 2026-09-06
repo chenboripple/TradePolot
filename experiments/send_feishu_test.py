@@ -5,9 +5,13 @@
 使用前请在飞书开放平台关闭签名校验
 """
 
+import os
+
 import httpx
 
-WEBHOOK = "https://open.feishu.cn/open-apis/bot/v2/hook/859cba37-0ce9-4381-90d4-dc15140af209"
+WEBHOOK = os.environ.get("FEISHU_WEBHOOK_URL", "")
+if not WEBHOOK:
+    raise SystemExit("❌ 请先设置环境变量 FEISHU_WEBHOOK_URL —— webhook 是机密，不要写进代码/提交进仓库")
 
 content = {
     "msg_type": "text",

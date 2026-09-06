@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """发送万华化学回测报告到飞书"""
 
+import os
+
 import httpx
 import json
 from pathlib import Path
@@ -17,7 +19,9 @@ if not result_path.exists():
 with open(result_path, 'r', encoding='utf-8') as f:
     result = json.load(f)
 
-WEBHOOK = "https://open.feishu.cn/open-apis/bot/v2/hook/859cba37-0ce9-4381-90d4-dc15140af209"
+WEBHOOK = os.environ.get("FEISHU_WEBHOOK_URL", "")
+if not WEBHOOK:
+    raise SystemExit("❌ 请先设置环境变量 FEISHU_WEBHOOK_URL —— webhook 是机密，不要写进代码/提交进仓库")
 
 content = {
     "msg_type": "text",
