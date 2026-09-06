@@ -449,6 +449,88 @@ tradepilot ml build-dataset --pool config|watchlist|catalog [--symbols A,B] \
 > 数据集/模型都只是**机制验证**，不是可交易信号——D3 `promote` 门禁会以样本量/新鲜度/OOS
 > Brier 三道闸默认拒绝晋升，UI 标 `demo`/`stale`。
 
+### ML 模型训练与样本外评估（D3/D4 · schema v15）
+
+D2 产出数据集后，D3（`ml/models.py` + `ml/registry.py`）训练模型、D4（`ml/evaluate.py`）评估。
+两者共守一条**懒加载铁律**：
+
+> **三个模块顶层只 import numpy**，sklearn/joblib 一律在函数内 `_require_sklearn()` 惰性加载。
+> 未安装时 `dashboard`/`monitor`/`serve` 的信号链路照常运行，只有 `ml train`/`ml promote` 报
+> 清晰错误（CLI exit 3）。该契约由 `tests/test_models.py::LazySklearnContractTest` 用 **AST 扫描
+> 模块顶层 import 语句**钉住——不是靠文档约定。
+
+**训练协议：锚定滚动 walk-forward**（复用 B3 `rolling_splits`，purge/embargo 已在切分层处理）。
+每折：在 `train_idx` 上拟合 → 在 `val_idx` 上选超参 / 拟合校准器 → 只预测 `test_idx`；把所有折
+的 OOS 预测拼成完整样本外序列。**模型选择永远看不到 test**，对外服役的工件 = 末折的
+model + calibrator。
+
+| kind | 模型 | NaN 处理 | 校准 |
+|------|------|----------|------|
+| `logreg` | `LogisticRegression(max_iter=1000)`，`C∈{0.01,0.1,1}` 按 val 折 Brier 选 | `SimpleImputer(median, add_indicator=True) + StandardScaler` Pipeline | `CalibratedClassifierCV(method="sigmoid", cv="prefit")` 在 val 折拟合 |
+| `hgb` | `HistGradientBoostingClassifier(max_iter=200, lr=0.06, max_leaf_nodes=15, l2=1.0)`，val 折早停 | **原生容忍**——D1 缺组置 NaN 无需插补 | 同上 |
+
+目标 `win5`（分类·5 日胜）/ `ret5`（回归·5 日净收益）/ `mae5`（回归·5 日最大不利偏移 =
+下行风险）。**只有分类做校准**（回归无概率可言）；回归摘要给 MAE/R²，分类给 AUC/Brier/ECE/
+覆盖率@阈值。
+
+**晋升门禁（4 道闸，`promote(model_id, force=False)`）**：
+
+| 门 | 条件 | 不过的后果 |
+|----|------|-----------|
+| `min_samples` | `n_rows ≥ 800` | 质量门 → force 落 **`demo`** |
+| `min_positives` | `n_positive ≥ 80` | 质量门 → force 落 **`demo`** |
+| `max_staleness` | 数据集 `max_trade_date` 距今 ≤ 120 天 | 新鲜度门 → force 仍可 **`promoted`** 但 `stale=true` |
+| `beats_base_rate` | 分类：OOS Brier < 常数基线 Brier `p̄(1−p̄)` | 质量门 → force 落 **`demo`** |
+
+全过 → `status='promoted'`、`stale=false`，并**退役同 (target, horizon) 的旧在位模型**
+（`retire_promoted_models`）。不过且未 force → 维持 `candidate`、CLI **exit 1**。不过但 force →
+质量门任一失败即 `demo`（演示工件，`load_promoted_model` 默认**不返回**，需 `include_demo=True`），
+仅新鲜度失败则 `promoted` + `stale`。状态枚举：`candidate | promoted | retired | demo`。
+
+**工件落盘** `data/ml/models/<model_id>/`：`model.joblib` + `calibrator.joblib` + `meta.json`
+（provenance：dataset_id、feature_groups、n_features、split_protocol、sklearn_version、status、
+stale）+ **`oos.npz`**（`oos_idx`/`p_oos`/`y_oos`/`net_ret`/`rec_buy`/`trade_dates`）。
+`model_id = f"{kind}-{target}-{sha256[:10]}"`，hash 含 `trained_at` 故每次训练唯一；元数据落
+**v15 新表 `ml_models`**（`register_model` 按 model_id upsert，四个 `*_json` 列编码
+feature_groups/selected_params/metrics/warnings）。
+
+**D4 评估：完全免 sklearn**——只读 `oos.npz` + `meta.json`，用 B4 `calibration.py` 的 numpy
+纯函数算完所有指标（`tests/test_evaluate.py` 刻意只写这两个文件、不写 `model.joblib`，证明
+评估链路不依赖 joblib）。三段报告：
+
+1. **判别**：AUC / LogLoss / Brier vs 常数基线 Brier；
+2. **校准**：logit 空间 slope/intercept、ECE、10 桶 reliability；
+3. **决策对比表**（直接回答"模型过滤比不过滤好多少"）：同一标签、同一 OOS 折上并列四方——
+   `rule_baseline`（规则引擎全部 BUY 票，`rec_buy`）｜`model_thr{0.50,0.55,0.60}`（模型过滤
+   `p ≥ thr`）｜`buy_hold`（全买）｜`index`（000300 同窗 horizon 日收益，缺指数行则省略并警告）。
+   每行列覆盖率 / 胜率 / 平均净收益 / 每信号期望 / 样本数。
+
+**警告区诚实标注**（`render_text` 单列一节）。硬警告带 `⚠️` 前缀：数据滞后（stale）｜演示模型
+（demo）｜OOS 样本偏少（`n_oos<200`，指标方差大）｜正例率失衡（`base_rate` 落在 0.2–0.8 之外，
+AUC/Brier 须结合覆盖率看）｜OOS 单一类别（AUC 无定义）｜未跑赢常数基线｜行业 point-in-time
+缺失（轻微前视）。两条**口径提示**用 `（…）` 而非 `⚠️`（是说明而非缺陷）：省略指数行
+（`index_daily` 无同窗数据）｜OOS 折内规则引擎零 BUY 票（`rule_baseline` 退化为空）。
+
+**CLI**：
+
+```
+tradepilot ml datasets                                  # 列出已注册数据集（train 需要 --dataset）
+tradepilot ml train --dataset <id> [--model logreg|hgb] [--target win5|ret5|mae5] \
+    [--splits 5 --embargo 2 --val-ratio 0.2 --threshold 0.5] [--models-dir] [--no-register]
+tradepilot ml list [--status candidate|promoted|retired|demo]
+tradepilot ml promote <model_id> [--force] [--min-samples --min-positives --max-staleness]
+tradepilot ml eval --model <id> [--threshold 0.7 ...] [--index-code 000300.SH] [--json path]
+```
+
+退出码约定：工件/数据集/模型不存在 → **2**，sklearn 未安装 → **3**，门禁拒绝晋升 → **1**。
+
+> ⚠️ **诚实定位（重要）**：合成夹具是**随机游走弱信号**，logreg 在其上 OOS AUC≈0.56、
+> Brier≈0.2536 **高于**常数基线 0.2500 → `beats_base_rate` 不过 → 默认拒晋升，`--force` 也只能
+> 落 `demo` + `stale=true`。**这是护栏正确工作，不是 bug**。指标质量类断言必须用
+> `synth.ml_frame`（逻辑斯谛真值链路，logreg 可达 AUC 0.82 / Brier 0.171 < 基线 0.244）；
+> `seed_market_db` 只用于 CLI 管道与集成测试。数据恢复并扩池后重跑 pipeline，才会产生第一个
+> 真正可晋升（`promoted`）的模型。
+
 ### 监控统一切日线（A3）
 
 改造前 monitor 与网页/CLI 回测**口径分裂**：监控每标的每轮拉近 5 天 1min 线（N 次网络/轮、

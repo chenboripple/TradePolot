@@ -931,6 +931,194 @@ def ml_build_dataset(pool, symbols, start, end, horizon, aux_horizon, groups,
         click.echo(f"   ⚠️ {warning}")
 
 
+@ml.command('datasets')
+def ml_datasets():
+    """列出已注册数据集（D2）——train 需从中取 dataset_id。"""
+    from .storage.database import list_datasets
+
+    datasets = list_datasets()
+    if not datasets:
+        click.echo("（无数据集，先用 ml build-dataset 构建）")
+        return
+    click.echo(
+        f"\n{'dataset_id':<14}{'rows':>7}{'pos%':>7}{'horizon':>9}"
+        f"{'fresh':>11}{'groups':>22}"
+    )
+    for item in datasets:
+        groups = ",".join(item.get("groups") or [])
+        click.echo(
+            f"{item['dataset_id']:<14}{item.get('n_rows', 0):>7}"
+            f"{(item.get('positive_rate') or 0) * 100:>6.1f}%{item.get('horizon', 5):>9}"
+            f"{str(item.get('max_trade_date') or ''):>11}{groups[:21]:>22}"
+        )
+
+
+@ml.command('train')
+@click.option('--dataset', required=True, help='数据集 ID（见 ml datasets）')
+@click.option('--model', 'kind', type=click.Choice(['logreg', 'hgb']), default='logreg',
+              help='logreg=线性+中位数插补 / hgb=梯度提升(原生吞 NaN)')
+@click.option('--target', type=click.Choice(['win5', 'ret5', 'mae5']), default='win5',
+              help='win5=胜率(分类) / ret5=净收益(回归) / mae5=下行风险(回归)')
+@click.option('--splits', type=int, default=5, help='锚定滚动 OOS 折数')
+@click.option('--embargo', type=int, default=2, help='purge 后再空的交易日数')
+@click.option('--val-ratio', type=float, default=0.2, help='验证折占训练段比例（选参/校准）')
+@click.option('--threshold', type=float, default=0.5, help='覆盖率/决策表默认阈值')
+@click.option('--models-dir', default=None, help='工件输出目录（默认 data/ml/models）')
+@click.option('--no-register', is_flag=True, help='只产工件，不写 ml_models 表')
+def ml_train(dataset, kind, target, splits, embargo, val_ratio, threshold,
+             models_dir, no_register):
+    """训练 ML 模型（D3）：数据集 → 滚动 OOS（选参/校准只看 train/val）→ 工件 + ml_models。
+
+    产出 status='candidate' 模型；用 `ml promote` 过晋升门禁后才进在位（数据恢复前
+    新鲜度门必触发，默认拒晋升）。sklearn 未装时干净报错退出（exit 3），不影响信号链路。
+    """
+    from .ml.registry import train_from_dataset
+
+    click.echo(
+        f"\n🧠 训练模型（D3）：dataset={dataset} · {kind}/{target} · "
+        f"splits={splits} embargo={embargo} val_ratio={val_ratio}"
+    )
+    try:
+        model_id, result = train_from_dataset(
+            dataset, kind, target,
+            n_splits=splits, embargo=embargo, val_ratio=val_ratio, threshold=threshold,
+            models_dir=Path(models_dir) if models_dir else None,
+            register=not no_register,
+        )
+    except ImportError as exc:
+        click.echo(f"❌ {exc}", err=True)
+        sys.exit(3)
+    except (FileNotFoundError, ValueError) as exc:
+        click.echo(f"❌ {exc}", err=True)
+        sys.exit(2)
+
+    metrics = result.metrics
+    click.echo(f"   model_id：{model_id}")
+    if result.is_classification:
+        auc = metrics.get("oos_auc")
+        auc_txt = "n/a" if auc is None or auc != auc else f"{auc:.4f}"
+        click.echo(
+            f"   OOS {metrics.get('n_oos', 0)} 行 · AUC {auc_txt} · "
+            f"Brier {metrics.get('oos_brier', 0):.4f}（基线 {metrics.get('base_rate_brier', 0):.4f}）· "
+            f"ECE {metrics.get('oos_ece', 0):.4f}"
+        )
+        click.echo(
+            f"   覆盖率@{threshold:g} {metrics.get('coverage_at_threshold', 0):.3f} · "
+            f"胜率 {metrics.get('win_rate_at_threshold', 0):.3f} · "
+            f"末折训练 {result.per_split[-1]['n_train'] if result.per_split else 0} 行"
+        )
+    else:
+        click.echo(
+            f"   OOS {metrics.get('n_oos', 0)} 行 · MAE {metrics.get('oos_mae', 0):.4f} · "
+            f"R² {metrics.get('oos_r2', 0):.4f}"
+        )
+    click.echo("   状态 candidate（用 ml promote 过门禁晋升；ml eval 看完整报告）")
+
+
+@ml.command('list')
+@click.option('--status', default=None,
+              help='按状态过滤：candidate|promoted|retired|demo')
+def ml_list(status):
+    """列出已注册模型（D3）。"""
+    from .storage.database import list_models
+
+    models = list_models(status=status)
+    if not models:
+        click.echo("（无模型，先用 ml train 训练）")
+        return
+    click.echo(
+        f"\n{'model_id':<26}{'kind':<8}{'target':<7}{'status':<11}"
+        f"{'stale':<6}{'AUC':>7}{'Brier':>8}{'n_oos':>7}"
+    )
+    for item in models:
+        auc = item.get("oos_auc")
+        auc_txt = "n/a" if auc is None or auc != auc else f"{auc:.3f}"
+        brier = item.get("oos_brier")
+        brier_txt = "n/a" if brier is None else f"{brier:.4f}"
+        stale_txt = "yes" if item.get("stale") else "—"
+        click.echo(
+            f"{item['model_id']:<26}{str(item.get('kind') or ''):<8}"
+            f"{str(item.get('target') or ''):<7}{str(item.get('status') or ''):<11}"
+            f"{stale_txt:<6}{auc_txt:>7}{brier_txt:>8}{item.get('n_oos', 0):>7}"
+        )
+
+
+@ml.command('promote')
+@click.argument('model_id')
+@click.option('--force', is_flag=True, help='门禁不过仍放行（打 stale/demo 标记）')
+@click.option('--min-samples', type=int, default=None, help='样本量门（默认 800 行）')
+@click.option('--min-positives', type=int, default=None, help='正例数门（默认 80）')
+@click.option('--max-staleness', type=int, default=None, help='新鲜度门（天，默认 120）')
+@click.option('--models-dir', default=None, help='工件目录（默认 data/ml/models）')
+def ml_promote(model_id, force, min_samples, min_positives, max_staleness, models_dir):
+    """晋升模型（D3 门禁）：样本量/正例数/新鲜度/OOS 判别力四道闸。
+
+    默认拒绝晋升（exit 1）；--force 放行：仅新鲜度不过 → promoted+stale，质量门不过 →
+    demo（演示工件，scoring 默认不取）。数据恢复前新鲜度门必触发——这是"演示模型不冒充
+    可用模型"的核心护栏。
+    """
+    from .ml import registry
+
+    kwargs = {}
+    if min_samples is not None:
+        kwargs["min_samples"] = min_samples
+    if min_positives is not None:
+        kwargs["min_positives"] = min_positives
+    if max_staleness is not None:
+        kwargs["max_staleness_days"] = max_staleness
+    try:
+        report = registry.promote(
+            model_id, force=force,
+            models_dir=Path(models_dir) if models_dir else None,
+            **kwargs,
+        )
+    except FileNotFoundError as exc:
+        click.echo(f"❌ {exc}", err=True)
+        sys.exit(2)
+
+    icon = "🎖️" if report.promoted else "⛔"
+    click.echo(
+        f"\n{icon} {model_id} → {report.status}{'（stale）' if report.stale else ''}"
+        f"{'（force）' if report.forced else ''}"
+    )
+    for gate in report.gates:
+        click.echo(f"   {'✓' if gate.passed else '✗'} {gate.name}：{gate.detail}")
+    for warning in report.warnings:
+        click.echo(f"   ⚠️ {warning}")
+    if not report.promoted:
+        sys.exit(1)
+
+
+@ml.command('eval')
+@click.option('--model', 'model_id', required=True, help='模型 ID（见 ml list）')
+@click.option('--threshold', type=float, multiple=True,
+              help='决策表阈值（可多次；默认 0.5/0.55/0.6）')
+@click.option('--index-code', default='000300.SH', help='指数同窗基准')
+@click.option('--json', 'json_path', default=None, help='同时写 JSON 报告到该路径')
+@click.option('--models-dir', default=None, help='工件目录（默认 data/ml/models）')
+def ml_eval(model_id, threshold, index_code, json_path, models_dir):
+    """评估模型 OOS 表现（D4）：判别 + 校准 + 决策对比表（四方）+ 警告区。
+
+    只读训练时存下的 OOS 预测，纯 numpy 计算——评估链路无需 sklearn。决策对比表在
+    同一 OOS 折、同一标签上并列：规则 BUY 基线 | 模型过滤 p≥阈值 | 买入持有 | 指数同窗。
+    """
+    from .ml.evaluate import DEFAULT_THRESHOLDS, dump_json, evaluate_model, render_text
+
+    thresholds = tuple(threshold) if threshold else DEFAULT_THRESHOLDS
+    try:
+        report = evaluate_model(
+            model_id, thresholds=thresholds, index_code=index_code,
+            models_dir=Path(models_dir) if models_dir else None,
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        click.echo(f"❌ {exc}", err=True)
+        sys.exit(2)
+    click.echo(render_text(report))
+    if json_path:
+        dump_json(report, json_path)
+        click.echo(f"   📄 JSON 报告：{json_path}")
+
+
 @cli.command()
 def version():
     """显示版本"""

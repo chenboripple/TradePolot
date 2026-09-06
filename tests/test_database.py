@@ -11,8 +11,10 @@ from ripple_tradePilot.storage import database_path, init_database
 from ripple_tradePilot.storage.__main__ import main as initialize_storage
 from ripple_tradePilot.storage.database import (
     DATABASE_SCHEMA_VERSION,
+    ML_MODELS_COLUMNS,
     industry_board_for_symbol,
     list_datasets,
+    list_models,
     list_stock_catalog,
     load_daily_bars,
     load_dataset_manifest,
@@ -21,8 +23,13 @@ from ripple_tradePilot.storage.database import (
     load_industry_boards,
     load_industry_membership,
     load_market_daily,
+    load_model,
+    load_promoted_model,
     record_market_daily,
     register_dataset,
+    register_model,
+    retire_promoted_models,
+    set_model_status,
     stock_catalog_industries,
     upsert_daily_bars,
     upsert_index_daily,
@@ -1046,6 +1053,240 @@ class SchemaV15MigrationTest(unittest.TestCase):
             register_dataset(_sample_manifest("ds_b"), target)
             ids = {d["dataset_id"] for d in list_datasets(target)}
             self.assertEqual(ids, {"ds_a", "ds_b"})
+
+
+def _sample_model(model_id="logreg-win5-abc1234567", **overrides):
+    """构造一个具代表性的 D3 ml_models 行（标量 + 全部 JSON 字段）。"""
+    row = {
+        "model_id": model_id,
+        "kind": "logreg",
+        "target": "win5",
+        "horizon": 5,
+        "dataset_id": "ds_abc123def456",
+        "n_features": 28,
+        "threshold": 0.5,
+        "oos_brier": 0.171,
+        "oos_auc": 0.817,
+        "oos_logloss": 0.42,
+        "oos_ece": 0.03,
+        "oos_mae": None,
+        "oos_r2": None,
+        "base_rate": 0.49,
+        "base_rate_brier": 0.2442,
+        "coverage_at_threshold": 0.68,
+        "win_rate_at_threshold": 0.62,
+        "n_oos": 735,
+        "n_train": 573,
+        "n_rows": 2000,
+        "n_positive": 900,
+        "max_trade_date": "20260801",
+        "status": "candidate",
+        "stale": False,
+        "artifact_path": "data/ml/models/logreg-win5-abc1234567",
+        "sklearn_version": "1.6.1",
+        "feature_groups": ["signal", "price_volume", "market", "industry"],
+        "selected_params": {"kind": "logreg", "C": 0.1},
+        "metrics": {"n_oos": 735, "oos_auc": 0.817},
+        "warnings": [],
+        "trained_at": "20260901T000000Z",
+    }
+    row.update(overrides)
+    return row
+
+
+class SchemaV15ModelsTest(unittest.TestCase):
+    """v15（D3 ``ml_models`` 模型注册表）迁移、幂等、唯一约束、状态流转与读写往返。"""
+
+    ML_MODELS_COLS = set(ML_MODELS_COLUMNS)
+
+    def _tables(self, target):
+        with sqlite3.connect(target) as connection:
+            return {
+                row[0]
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )
+            }
+
+    def _columns(self, target, table):
+        with sqlite3.connect(target) as connection:
+            return {row[1] for row in connection.execute(f"PRAGMA table_info({table})")}
+
+    def test_fresh_db_has_ml_models_table(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target = Path(temp_dir) / "fresh15m.db"
+            init_database(target)
+            self.assertIn("ml_models", self._tables(target))
+            self.assertTrue(self.ML_MODELS_COLS.issubset(self._columns(target, "ml_models")))
+            with sqlite3.connect(target) as connection:
+                version = connection.execute("PRAGMA user_version").fetchone()[0]
+                indexes = {
+                    row[1] for row in connection.execute("PRAGMA index_list(ml_models)")
+                }
+            self.assertEqual(version, DATABASE_SCHEMA_VERSION)
+            self.assertIn("idx_ml_models_status", indexes)
+
+    def test_legacy_db_without_ml_models_upgrades(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target = Path(temp_dir) / "legacy15m.db"
+            init_database(target)
+            with sqlite3.connect(target) as connection:
+                connection.execute("DROP TABLE ml_models")
+                connection.execute("PRAGMA user_version=14")
+            self.assertNotIn("ml_models", self._tables(target))
+
+            init_database(target)  # 重新初始化补建 v15 ml_models
+
+            self.assertIn("ml_models", self._tables(target))
+            self.assertTrue(self.ML_MODELS_COLS.issubset(self._columns(target, "ml_models")))
+
+    def test_legacy_row_gains_new_columns(self):
+        # _ensure_columns 增量补列：旧库缺列时 ALTER TABLE 补齐
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target = Path(temp_dir) / "altcols15m.db"
+            init_database(target)
+            with sqlite3.connect(target) as connection:
+                connection.execute("ALTER TABLE ml_models DROP COLUMN oos_ece")
+            self.assertNotIn("oos_ece", self._columns(target, "ml_models"))
+            init_database(target)
+            self.assertIn("oos_ece", self._columns(target, "ml_models"))
+
+    def test_ml_models_primary_key_is_model_id(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target = Path(temp_dir) / "pk15m.db"
+            init_database(target)
+            with sqlite3.connect(target) as connection:
+                pk_cols = [
+                    row[1]
+                    for row in connection.execute("PRAGMA table_info(ml_models)")
+                    if row[5]
+                ]
+            self.assertEqual(pk_cols, ["model_id"])
+
+    def test_register_model_and_load_roundtrip(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target = Path(temp_dir) / "reg15m.db"
+            model = _sample_model()
+            model_id = register_model(model, target)
+            self.assertEqual(model_id, model["model_id"])
+
+            loaded = load_model(model_id, target)
+            self.assertIsNotNone(loaded)
+            self.assertEqual(loaded["kind"], "logreg")
+            self.assertEqual(loaded["target"], "win5")
+            self.assertEqual(loaded["horizon"], 5)
+            self.assertEqual(loaded["n_features"], 28)
+            self.assertAlmostEqual(loaded["oos_brier"], 0.171)
+            self.assertAlmostEqual(loaded["oos_auc"], 0.817)
+            self.assertIsNone(loaded["oos_mae"])  # 分类目标无回归指标
+            self.assertEqual(loaded["n_oos"], 735)
+            self.assertEqual(loaded["max_trade_date"], "20260801")
+            self.assertEqual(loaded["status"], "candidate")
+            self.assertIs(loaded["stale"], False)  # INTEGER 0 → bool
+            # JSON 字段解码回原生 list/dict
+            self.assertEqual(
+                loaded["feature_groups"], ["signal", "price_volume", "market", "industry"]
+            )
+            self.assertEqual(loaded["selected_params"]["C"], 0.1)
+            self.assertEqual(loaded["metrics"]["oos_auc"], 0.817)
+            self.assertEqual(loaded["warnings"], [])
+            self.assertIsNotNone(loaded["created_at"])
+
+    def test_register_model_upsert_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target = Path(temp_dir) / "upsert15m.db"
+            register_model(_sample_model(), target)
+            register_model(_sample_model(status="promoted", oos_auc=0.9), target)
+            models = list_models(target)
+            self.assertEqual(len(models), 1)
+            self.assertEqual(models[0]["status"], "promoted")
+            self.assertAlmostEqual(models[0]["oos_auc"], 0.9)
+
+    def test_load_missing_model_returns_none(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target = Path(temp_dir) / "missing15m.db"
+            init_database(target)
+            self.assertIsNone(load_model("nope", target))
+            self.assertEqual(list_models(target), [])
+
+    def test_list_models_status_filter(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target = Path(temp_dir) / "listfilter15m.db"
+            register_model(_sample_model("logreg-win5-aaa", status="candidate"), target)
+            register_model(_sample_model("logreg-win5-bbb", status="promoted"), target)
+            register_model(_sample_model("hgb-win5-ccc", status="demo"), target)
+            self.assertEqual(len(list_models(target)), 3)
+            self.assertEqual(
+                [m["model_id"] for m in list_models(target, status="promoted")],
+                ["logreg-win5-bbb"],
+            )
+            self.assertEqual(len(list_models(target, status="demo")), 1)
+
+    def test_set_model_status_updates_fields(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target = Path(temp_dir) / "setstatus15m.db"
+            mid = register_model(_sample_model(), target)
+            set_model_status(mid, "promoted", stale=True, warnings=["数据滞后"], path=target)
+            loaded = load_model(mid, target)
+            self.assertEqual(loaded["status"], "promoted")
+            self.assertIs(loaded["stale"], True)
+            self.assertEqual(loaded["warnings"], ["数据滞后"])
+
+    def test_set_model_status_without_optional_keeps_stale(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target = Path(temp_dir) / "setstatus2.db"
+            mid = register_model(_sample_model(stale=True), target)
+            set_model_status(mid, "retired", path=target)  # 不传 stale → 保持原值
+            loaded = load_model(mid, target)
+            self.assertEqual(loaded["status"], "retired")
+            self.assertIs(loaded["stale"], True)
+
+    def test_retire_promoted_models_excludes_self(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target = Path(temp_dir) / "retire15m.db"
+            register_model(_sample_model("logreg-win5-old", status="promoted"), target)
+            register_model(_sample_model("logreg-win5-old2", status="demo"), target)
+            register_model(_sample_model("logreg-win5-keep", status="promoted"), target)
+            register_model(_sample_model("logreg-ret5-other", status="promoted", target="ret5"), target)
+            n = retire_promoted_models("win5", 5, exclude_model_id="logreg-win5-keep", path=target)
+            self.assertEqual(n, 2)  # old + old2 退役，keep 排除，ret5 不同目标不动
+            self.assertEqual(load_model("logreg-win5-old", target)["status"], "retired")
+            self.assertEqual(load_model("logreg-win5-old2", target)["status"], "retired")
+            self.assertEqual(load_model("logreg-win5-keep", target)["status"], "promoted")
+            self.assertEqual(load_model("logreg-ret5-other", target)["status"], "promoted")
+
+    def test_load_promoted_model_default_excludes_demo(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target = Path(temp_dir) / "loadprom15m.db"
+            register_model(_sample_model("logreg-win5-demo", status="demo"), target)
+            self.assertIsNone(load_promoted_model("win5", path=target))
+            loaded = load_promoted_model("win5", include_demo=True, path=target)
+            self.assertIsNotNone(loaded)
+            self.assertEqual(loaded["model_id"], "logreg-win5-demo")
+
+    def test_load_promoted_model_picks_latest_and_filters_target(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target = Path(temp_dir) / "loadprom2.db"
+            register_model(
+                _sample_model("logreg-win5-early", status="promoted", trained_at="20260101T000000Z"),
+                target,
+            )
+            register_model(
+                _sample_model("logreg-win5-late", status="promoted", trained_at="20260901T000000Z"),
+                target,
+            )
+            register_model(_sample_model("logreg-ret5-x", status="promoted", target="ret5"), target)
+            latest = load_promoted_model("win5", path=target)
+            self.assertEqual(latest["model_id"], "logreg-win5-late")
+            # 不带 target → 全局最新（win5-late 的 trained_at 最大）
+            any_latest = load_promoted_model(path=target)
+            self.assertEqual(any_latest["model_id"], "logreg-win5-late")
+
+    def test_load_promoted_model_none_when_empty(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target = Path(temp_dir) / "loadprom3.db"
+            init_database(target)
+            self.assertIsNone(load_promoted_model("win5", path=target))
 
 
 if __name__ == "__main__":

@@ -27,6 +27,7 @@ __all__ = [
     "DecisionValue",
     "brier_score",
     "log_loss",
+    "roc_auc_score",
     "reliability_table",
     "expected_calibration_error",
     "calibration_slope_intercept",
@@ -191,6 +192,36 @@ def coverage_at_threshold(p: Sequence[float], threshold: float) -> float:
     if p_arr.size == 0:
         return 0.0
     return float(np.mean(p_arr >= threshold))
+
+
+def roc_auc_score(y: Sequence[int], p: Sequence[float]) -> float:
+    """ROC AUC（Mann-Whitney U 统计量，ties 取平均秩），numpy 自实现不依赖 sklearn。
+
+    判别力度量：随机取一正一负样本，模型给正样本更高分的概率。0.5=瞎猜、1.0=完美。
+    单一类别（全正或全负）时 AUC 无定义，返回 ``nan``（调用方据此跳过判别判定）。
+
+    D3 训练摘要与 D4 评估报告共用本函数——评估只读已存 OOS 预测，故**整条评估链路
+    无需 sklearn**（与"未安装环境全模块 import 不炸"一致）。
+    """
+    y_arr = _as_array(y)
+    p_arr = _as_array(p)
+    if y_arr.shape != p_arr.shape:
+        raise ValueError("y 与 p 长度必须一致")
+    pos = p_arr[y_arr == 1]
+    neg = p_arr[y_arr == 0]
+    n_pos, n_neg = pos.size, neg.size
+    if n_pos == 0 or n_neg == 0:
+        return float("nan")
+    all_p = np.concatenate([pos, neg])
+    # 唯一值 → 平均秩（ties 取该组首尾秩的均值）
+    _, inverse = np.unique(all_p, return_inverse=True)
+    counts = np.bincount(inverse)
+    cum_before = np.cumsum(counts) - counts
+    avg_ranks = cum_before + (counts + 1) / 2.0
+    ranks_all = avg_ranks[inverse]
+    rank_pos_sum = float(ranks_all[:n_pos].sum())
+    u = rank_pos_sum - n_pos * (n_pos + 1) / 2.0
+    return float(u / (n_pos * n_neg))
 
 
 @dataclass(frozen=True)

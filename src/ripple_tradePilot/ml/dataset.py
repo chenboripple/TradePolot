@@ -66,6 +66,7 @@ __all__ = [
     "DEFAULT_ML_DIR",
     "build_dataset",
     "load_dataset_frame",
+    "load_dataset",
 ]
 
 # 标签/元数据列（非特征）；D3 训练时据此区分 X 与 y。
@@ -135,6 +136,25 @@ class DatasetManifest:
 def load_dataset_frame(csv_path: Union[str, Path]) -> pd.DataFrame:
     """回读 ``build_dataset`` 产出的 csv.gz（含特征 + 标签 + exit_date）。"""
     return pd.read_csv(str(csv_path), compression="gzip")
+
+
+def load_dataset(
+    dataset_id: str, db_path: Optional[Path] = None
+) -> Tuple[Dict[str, Any], pd.DataFrame]:
+    """按 ``dataset_id`` 从 ``ml_datasets`` 取 manifest 并回读帧。
+
+    返回 ``(manifest_dict, frame)``；数据集未注册或 csv 缺失则抛 ``FileNotFoundError``。
+    D3 训练据此还原 X/y/日期轴，D4/D5 据此对齐特征列。
+    """
+    from ripple_tradePilot.storage.database import load_dataset_manifest
+
+    manifest = load_dataset_manifest(dataset_id, db_path)
+    if manifest is None:
+        raise FileNotFoundError(f"数据集未注册：{dataset_id}")
+    csv_path = manifest.get("csv_path")
+    if not csv_path or not Path(csv_path).exists():
+        raise FileNotFoundError(f"数据集 csv 缺失：{csv_path}（dataset_id={dataset_id}）")
+    return manifest, load_dataset_frame(csv_path)
 
 
 def _resolve_spec(
