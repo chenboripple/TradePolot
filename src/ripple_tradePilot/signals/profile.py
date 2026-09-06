@@ -191,7 +191,13 @@ def _single_component(kind: str, profile: Mapping[str, Any]) -> ComponentSpec:
 
 def _component_params(kind: str, container: Mapping[str, Any]) -> Dict[str, Any]:
     """从容器（profile 或组件字典）提取 canonical 参数：
-    嵌套节 → 容器内直接键 → 扁平前缀键 → 默认值。"""
+    嵌套节 → ``params`` 子节 → 容器内直接键 → 扁平前缀键 → 默认值。"""
+    # canonical 的组件字典形态是 {"name","kind","params":{...}}（ml/dataset 的训练画像快照、
+    # 系统画像序列化都用它）。不抬平就会整组静默回落默认值——D5 serve 端拿默认 MA5/20 去喂
+    # 一个按 MA5/10 训练的模型，是典型的 train/serve 偏斜，且没有任何报错。
+    nested_params = container.get("params")
+    if isinstance(nested_params, Mapping):
+        container = {**container, **nested_params}
     section: Mapping[str, Any] = {}
     for section_key in _SECTION_KEYS.get(kind, ()):
         nested = container.get(section_key)

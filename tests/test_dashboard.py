@@ -1,4 +1,5 @@
 import csv
+import json
 import tempfile
 import unittest
 from datetime import date, timedelta
@@ -10,7 +11,9 @@ from ripple_tradePilot.api.dashboard import DashboardService
 from ripple_tradePilot.storage.database import upsert_daily_bars
 
 
-class DashboardServiceTest(unittest.TestCase):
+class _DashboardFixture(unittest.TestCase):
+    """共享夹具：tmp config.yaml（股票/期货各一 + combo_vote 画像）+ 60 根线性上涨 CSV。"""
+
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.root = Path(self.temp_dir.name)
@@ -80,13 +83,15 @@ class DashboardServiceTest(unittest.TestCase):
                     }
                 )
 
-    def _service(self):
+    def _service(self, scorer=None):
         return DashboardService(
             data_dir=self.data_dir,
             config_path=self.config_path,
             backtest_db=self.root / "missing.db",
+            scorer=scorer,
         )
 
+class DashboardServiceTest(_DashboardFixture):
     def test_dashboard_separates_stocks_and_futures(self):
         dashboard = self._service().dashboard()
 
@@ -131,7 +136,9 @@ class DashboardServiceTest(unittest.TestCase):
 
     def test_confidence_removed_vote_ratio_present(self):
         detail = self._service().market_detail("000001.SZ")
-        self.assertNotIn("confidence", detail)
+        # 递归查（序列化整棵树）：D5 的 forecast 块是嵌套结构，只查顶层会让
+        # forecast.confidence 这种"伪概率换个地方回潮"悄悄溜过去
+        self.assertNotIn("confidence", json.dumps(detail, ensure_ascii=False, default=str))
         self.assertIn("vote_ratio", detail)
         # 1 票 / 3 组件 → 33%
         self.assertEqual(detail["vote_ratio"], 33)
@@ -213,6 +220,102 @@ class DashboardServiceTest(unittest.TestCase):
         self.assertEqual(selected["parameters"]["ma_fast"], 2)
         self.assertNotEqual(selected["indicators"]["ma_fast"], default["indicators"]["ma_fast"])
         self.assertEqual(selected["recommendation"], "BUY")
+
+
+_FORECAST_PAYLOAD = {
+    "model_id": "logreg-win5-abc1234567",
+    "target": "win5",
+    "horizon_days": 5,
+    "as_of": "20260801",
+    "p_win": 0.5812,
+    "expected_net_return": 0.012345,
+    "downside_mae": -0.031,
+    "status": "promoted",
+    "stale": False,
+    "return_basis": "主模型 OOS 历史中 p≥0.581 子集的已实现平均净收益（n=120，覆盖率 16.0%）",
+    "oos_n_signals": 120,
+    "oos_coverage": 0.16,
+    "oos_win_rate": 0.58,
+    "warnings": ["（预估基准日 20260801 = 库内最新已收盘交易日，非盘中实时）"],
+}
+
+
+class _StubForecast:
+    """替身 ScoreResult：只提供 dashboard 用到的 ``to_dict()``。"""
+
+    def __init__(self, payload):
+        self._payload = payload
+
+    def to_dict(self):
+        return dict(self._payload)
+
+
+class _StubScorer:
+    """替身 SignalScorer（本仓测试不用 mock 库，手写鸭子类型替身更直白）。
+
+    ``payload=None`` 模拟"该标的无数据/无在位模型"，``error`` 模拟打分抛错。
+    """
+
+    def __init__(self, payload=None, error=None):
+        self.calls = []
+        self._payload = payload
+        self._error = error
+
+    def score_symbol(self, symbol, **kwargs):
+        self.calls.append((symbol, kwargs))
+        if self._error is not None:
+            raise self._error
+        return None if self._payload is None else _StubForecast(self._payload)
+
+
+class ForecastBlockTest(_DashboardFixture):
+    """D5：``market_detail`` 的 ``forecast`` 块（注入替身打分器，零 sklearn 依赖）。"""
+
+    def test_no_scorer_forecast_is_null(self):
+        detail = self._service().market_detail("000001.SZ")
+        # 键必须存在（前端不判 undefined），值为 null → 只显示 vote_ratio
+        self.assertIn("forecast", detail)
+        self.assertIsNone(detail["forecast"])
+        self.assertEqual(detail["vote_ratio"], 33)
+
+    def test_forecast_payload_passthrough(self):
+        scorer = _StubScorer(_FORECAST_PAYLOAD)
+        detail = self._service(scorer=scorer).market_detail("000001.SZ")
+        self.assertEqual(detail["forecast"], _FORECAST_PAYLOAD)
+        # 打分走看板同一个库文件（与其余读库口径一致）
+        self.assertEqual(scorer.calls, [("000001.SZ", {"db_path": self.root / "missing.db"})])
+        # 规则票与模型概率并列，不互相冒充
+        self.assertEqual(detail["vote_ratio"], 33)
+        self.assertEqual(detail["forecast"]["p_win"], 0.5812)
+
+    def test_scorer_returning_none_degrades_quietly(self):
+        detail = self._service(scorer=_StubScorer(None)).market_detail("000001.SZ")
+        self.assertIsNone(detail["forecast"])
+        self.assertEqual(detail["recommendation"], "CONFLICT")
+
+    def test_scorer_error_cannot_break_dashboard(self):
+        scorer = _StubScorer(error=RuntimeError("joblib 炸了"))
+        detail = self._service(scorer=scorer).market_detail("000001.SZ")
+        self.assertEqual(scorer.calls[0][0], "000001.SZ")
+        self.assertIsNone(detail["forecast"])
+        self.assertIn("recommendation", detail)
+        self.assertEqual(len(detail["bars"]), 60)  # 夹具只有 60 根，详情其余部分完好
+
+    def test_list_endpoints_skip_scoring(self):
+        # 列表型调用逐标的打分是 N 倍读库开销，而列表视图不展示预估 → 必须关掉
+        scorer = _StubScorer(_FORECAST_PAYLOAD)
+        service = self._service(scorer=scorer)
+        dashboard = service.dashboard()
+        catalog = service.strategy_catalog()
+        self.assertEqual(scorer.calls, [])
+        self.assertTrue(dashboard["markets"])
+        self.assertTrue(catalog)
+
+    def test_with_forecast_false_on_detail(self):
+        scorer = _StubScorer(_FORECAST_PAYLOAD)
+        detail = self._service(scorer=scorer).market_detail("000001.SZ", with_forecast=False)
+        self.assertIsNone(detail["forecast"])
+        self.assertEqual(scorer.calls, [])
 
 
 if __name__ == "__main__":

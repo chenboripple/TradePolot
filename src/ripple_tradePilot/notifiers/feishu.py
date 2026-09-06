@@ -127,6 +127,35 @@ class FeishuWebhookNotifier:
                 "text": {"tag": "lark_md", "content": "\n".join(status_lines)},
             })
 
+        # D5：ML 模型预估块（monitor 收盘例程经 extra_info['forecast'] 传入 ScoreResult.to_dict()）。
+        # 缺字段就省略该行，绝不补 0——0.00% 会被读成"预测不涨不跌"，是撒谎。
+        forecast = info.get("forecast")
+        if forecast and forecast.get("p_win") is not None:
+            metric_parts = [f"• 胜率（{forecast.get('horizon_days', 5)}日）："
+                            f"**{forecast['p_win']:.1%}**"]
+            if forecast.get("expected_net_return") is not None:
+                metric_parts.append(
+                    f"• 期望净收益：**{forecast['expected_net_return']:+.2%}**"
+                )
+            if forecast.get("downside_mae") is not None:
+                metric_parts.append(f"• 参考下行：**{forecast['downside_mae']:.2%}**")
+            head = "🧠 **模型预估**"
+            if forecast.get("status") == "demo":
+                head += "（演示模型，门禁未过，不可作为交易依据）"
+            elif forecast.get("stale"):
+                head += "（数据滞后，模型已标 stale）"
+            forecast_lines = [head, *metric_parts]
+            if forecast.get("return_basis"):
+                forecast_lines.append(f"口径：{forecast['return_basis']}")
+            forecast_lines.append(
+                f"基准日 {forecast.get('as_of', '--')} · 模型 {forecast.get('model_id', '--')}"
+            )
+            elements.append({"tag": "hr"})
+            elements.append({
+                "tag": "div",
+                "text": {"tag": "lark_md", "content": "\n".join(forecast_lines)},
+            })
+
         # 风控提示价（仅买入信号有意义：给出参考止损/止盈位）
         stop_loss = info.get("stop_loss")
         take_profit = info.get("take_profit")

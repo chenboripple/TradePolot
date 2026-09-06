@@ -338,10 +338,17 @@ def render_text(report: EvalReport) -> str:
     lines.append(header)
     for row in report.decision_rows:
         thr = "—" if row.threshold is None else f"{row.threshold:.2f}"
-        wr = "n/a" if np.isnan(row.win_rate) else f"{row.win_rate:.3f}"
+        # 空子集（OOS 折内规则零 BUY 票时 rule_baseline 就是空的）不给数字：
+        # 0.000/0.00% 会被读成"测过了，胜率零、收益零"，而真相是"没有样本"
+        if row.n_signals == 0:
+            cov = wr = avg = exp = "n/a"
+        else:
+            cov = f"{row.coverage:.3f}"
+            wr = "n/a" if np.isnan(row.win_rate) else f"{row.win_rate:.3f}"
+            avg = f"{row.avg_net_return:.4%}"
+            exp = f"{row.expectancy:.4%}"
         lines.append(
-            f"   {row.strategy:<16}{thr:>6}{row.coverage:>9.3f}{wr:>9}"
-            f"{row.avg_net_return:>11.4%}{row.expectancy:>12.4%}{row.n_signals:>7}"
+            f"   {row.strategy:<16}{thr:>6}{cov:>9}{wr:>9}{avg:>11}{exp:>12}{row.n_signals:>7}"
         )
     if report.warnings:
         lines.append("   ── 警告 ──")

@@ -531,6 +531,67 @@ tradepilot ml eval --model <id> [--threshold 0.7 ...] [--index-code 000300.SH] [
 > `seed_market_db` 只用于 CLI 管道与集成测试。数据恢复并扩池后重跑 pipeline，才会产生第一个
 > 真正可晋升（`promoted`）的模型。
 
+### ML 预估消费与全管道（D5/D6）
+
+D3/D4 把模型训练出来、评估明白，D5（`ml/scoring.py`）让**看板与监控真正用上它**，D6
+（`ml/pipeline.py` + `tradepilot ml pipeline`）把 D1–D5 串成一键回归入口。
+
+**核心区分：`vote_ratio` ≠ `p_win`（两个数并排显示，永不互相冒充）**
+
+| 量 | 来源 | 含义 | 缺位时 |
+|----|------|------|--------|
+| `vote_ratio` | A1 规则投票（`buy_count / 组件数`） | 规则票占比，**不是概率** | 恒有（无需模型） |
+| `p_win` | D5 在位分类模型 | 5 日胜的**校准概率** | 无 promoted 模型 → `forecast=null` |
+
+A2 已把 `confidence` 一词全链路废除；D5 只**追加** `p_win`，不回潮 `confidence`。看板
+`market_detail` 多一个 `"forecast": {...} | null` 字段；前端有 `forecast` 就显示"模型预估(5日)：
+胜率 58% · 期望净收益 +1.2% · 参考下行 −3.1%"，没有就只显示"方向一致度 x%（规则票，非概率）"。
+
+**`SignalScorer.try_load()` 懒加载 + 优雅回退**：sklearn 未装 / 无 `promoted` 模型 / 工件缺失 →
+返回 `None`，看板监控照常出规则信号（`forecast=null`），绝不因 ML 缺席而崩。`demo` 模型默认
+**不取**（需 `include_demo=True`），取到 `stale`/`demo` 时在 `warnings` 里显式打出。
+
+**train/serve 一致性（D 阶段头号风险，硬测试钉死）**：`score_symbol` 内部构建特征行时，与
+`build_dataset` **调用同一个 `assemble_dataset_frames`**，并读取数据集 manifest 里的**训练画像
+快照**（`_spec_snapshot`）复现训练时的 `ProfileSpec`——不是用当前 config 的画像。
+`tests/test_scoring.py::TrainServeConsistencyTest` 逐 (symbol, trade_date) 逐列 `np.allclose`
+断言 scorer 的特征向量 == 数据集那一行，且 `assertEqual(checked, manifest.n_rows)` 防空跑。
+
+> 🐛 **修了一个真 train/serve 偏斜 bug**：`signals/profile.py::_component_params` 曾忽略 canonical
+> 组件字典里的 `params` 子节（`{"name","kind","params":{...}}`，正是 `_spec_snapshot` 写进 manifest
+> 的形态），导致 D5 serve 端把**默认 MA5/20+RSI14** 的票喂给一个按 **MA5/10+RSI7** 训练的模型——
+> 静默偏斜、零报错。修复：解析前把 `params` 子节抬平进容器，再走原有优先级链（嵌套节 → params →
+> 直接键 → 扁平前缀键 → 默认）。回归测试 `test_signals_voting.py::test_components_nested_params_roundtrip`。
+
+**监控台账回填（B2 预留列落地）**：收盘例程 `_finalize_after_close` 给每个确认信号算 forecast，
+`SignalNotifier.send` 经 `extra_info['forecast']` 把 `ScoreResult.to_dict()` 交给飞书卡片渲染
+（`feishu.py` 认这个键，画出 🧠 模型预估块）；同时把 `model_id / p_win / expected_ret /
+downside_mae` 四列写进 `signal_ledger`。**预估是增强项**：其序列化单独 try/except，坏掉的
+`to_dict()` 只会让这条通知不带预估，**绝不吞掉整条信号通知**（`monitor/main.py`；回归测试
+`test_monitor_daily.py::ForecastPlumbingTest`、`test_watchlist_and_feishu.py::FeishuForecastCardTest`）。
+
+**D6 一键管道 `tradepilot ml pipeline`**（`ml/pipeline.py`，不 import click、进度走 `progress`
+回调，故可脱离 CliRunner 直接测）：
+
+```
+tradepilot ml pipeline --pool config|watchlist|catalog [--symbols A,B] [--start --end] \
+    [--horizon 5 --aux-horizon 10] [--groups signal,price_volume,market,industry] \
+    [--models logreg,hgb] [--target win5] [--aux-targets ret5,mae5] \
+    [--splits 5 --embargo 2 --val-ratio 0.2 --threshold 0.5 ...] \
+    [--out-dir --models-dir --report-dir reports] [--promote] [--force]
+```
+
+串起 build-dataset → train（kind×target 全组合，各独立 candidate）→ eval（**只对分类目标出决策
+对比表**，回归的 AUC/Brier 无意义）→〔可选〕promote → markdown 报告（`reports/ml-pipeline-<dataset_id>.md`）。
+退出码沿用 D3/D4：**2** = 空池/非法 kind/非法组/缺工件，**3** = sklearn 未装，**0** = 跑通
+（哪怕门禁未过——报告照写）。
+
+> ⚠️ **默认不晋升（`promote_models=False`）**：一次回归跑悄悄换掉看板/监控正在用的在位模型是
+> **事故**，不是便利。要动在位模型必须显式 `--promote`，且仍受 D3 四道门禁约束。报告尾部固定一段
+> **诚实定位**声明 + 每个数字都标了数据集新鲜度与 OOS 样本数，缺失一律渲染 `n/a`（绝不写成 0），
+> 空子集（如 OOS 折内规则零 BUY 票的 `rule_baseline`）渲染 `—`（不写 `0.00%`，那会被读成"测过了、
+> 收益为零"）。详见 `docs/ml-signal-quality.md`。
+
 ### 监控统一切日线（A3）
 
 改造前 monitor 与网页/CLI 回测**口径分裂**：监控每标的每轮拉近 5 天 1min 线（N 次网络/轮、

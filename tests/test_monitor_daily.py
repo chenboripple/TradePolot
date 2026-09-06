@@ -161,11 +161,12 @@ class _MonitorBase(unittest.TestCase):
         bars = synth.daily_bars(count, seed=seed)
         upsert_daily_bars(symbol, synth.daily_rows(bars), "synth", self.db_path)
 
-    def _consume(self, evaluation, *, results=None, write_ledger=False, profile_name=None):
+    def _consume(self, evaluation, *, results=None, write_ledger=False, profile_name=None,
+                 forecast=None):
         out = [] if results is None else results
         self.monitor._consume_evaluation(
             SYMBOL, "浦发银行", profile_name, evaluation, out,
-            write_ledger=write_ledger, data_version=None,
+            write_ledger=write_ledger, data_version=None, forecast=forecast,
         )
         return out
 
@@ -480,6 +481,165 @@ class SnapshotStalenessTest(_MonitorBase):
         with patch("ripple_tradePilot.monitor.main.load_stock_quotes", return_value=[]):
             self.monitor._refresh_snapshot()
         self.assertEqual(svc.refresh_quotes_calls, 1)   # 无快照（latest None）→ 视为陈旧
+
+
+class _StubForecast:
+    """替身 ``ml.scoring.ScoreResult``：monitor 只读这几个属性 + ``to_dict()``。"""
+
+    def __init__(self, *, p_win=0.5812, expected=0.0123, downside=-0.031,
+                 horizon=5, as_of="20260904", model_id="logreg-win5-abc1234567",
+                 status="promoted"):
+        self.p_win = p_win
+        self.expected_net_return = expected
+        self.downside_mae = downside
+        self.horizon_days = horizon
+        self.as_of = as_of
+        self.model_id = model_id
+        self.status = status
+
+    def to_dict(self):
+        return {
+            "model_id": self.model_id, "p_win": self.p_win,
+            "expected_net_return": self.expected_net_return,
+            "downside_mae": self.downside_mae, "horizon_days": self.horizon_days,
+            "as_of": self.as_of, "status": self.status,
+        }
+
+
+class _StubScorer:
+    def __init__(self, forecast=None, error=None):
+        self.calls = []
+        self._forecast = forecast
+        self._error = error
+
+    def score_symbol(self, symbol, **kwargs):
+        self.calls.append((symbol, kwargs))
+        if self._error is not None:
+            raise self._error
+        return self._forecast
+
+
+class ForecastPlumbingTest(_MonitorBase):
+    """D5：预估块贯穿收盘通知 → 飞书卡片 → 台账四列，且任何失败都不影响监控。"""
+
+    def _buy_eval(self, provisional=False):
+        dec = _buy_decision()
+        return _eval(dec, provisional=provisional, events=(_buy_event(dec),), n_bars=1)
+
+    # --- 文本块 ---
+    def test_forecast_text_renders_all_segments(self):
+        text = self.monitor.notifier._forecast_text(_StubForecast())
+        self.assertIn("🧠 模型预估（5日 · 基准 20260904）", text)
+        self.assertIn("胜率 58.1%", text)
+        self.assertIn("期望净收益 +1.23%", text)
+        self.assertIn("参考下行 -3.10%", text)
+
+    def test_forecast_text_omits_unavailable_segments(self):
+        # 缺 ret5/mae5 在位模型 → 整段省略。写 0.00% 会被读成"预测不涨不跌"，是撒谎
+        text = self.monitor.notifier._forecast_text(
+            _StubForecast(expected=None, downside=None)
+        )
+        self.assertIn("胜率 58.1%", text)
+        self.assertNotIn("期望净收益", text)
+        self.assertNotIn("参考下行", text)
+        self.assertNotIn("0.00%", text)
+
+    def test_forecast_text_flags_demo_model(self):
+        text = self.monitor.notifier._forecast_text(_StubForecast(status="demo"))
+        self.assertIn("演示模型", text)
+
+    def test_forecast_text_empty_without_p_win(self):
+        self.assertEqual(self.monitor.notifier._forecast_text(None), "")
+        self.assertEqual(self.monitor.notifier._forecast_text(_StubForecast(p_win=None)), "")
+
+    # --- 通知 ---
+    def test_notification_carries_forecast_to_feishu(self):
+        forecast = _StubForecast()
+        self._consume(self._buy_eval(), forecast=forecast)
+        self.assertEqual(len(self.fake.signals), 1)
+        extra = self.fake.signals[0]["extra_info"]
+        self.assertEqual(extra["forecast"], forecast.to_dict())
+        self.assertIs(extra["provisional"], False)  # 收盘确认路径
+
+    def test_broken_forecast_cannot_suppress_notification(self):
+        class _BrokenForecast(_StubForecast):
+            def to_dict(self):
+                raise RuntimeError("序列化炸了")
+
+        self._consume(self._buy_eval(), forecast=_BrokenForecast())
+        # 预估是增强项：它出错时通知照发，只是不带 forecast 键
+        self.assertEqual(len(self.fake.signals), 1)
+        self.assertNotIn("forecast", self.fake.signals[0]["extra_info"])
+
+    def test_notification_without_forecast_has_no_key(self):
+        self._consume(self._buy_eval())
+        self.assertNotIn("forecast", self.fake.signals[0]["extra_info"])
+
+    # --- 台账 ---
+    def test_ledger_records_forecast_columns(self):
+        self._consume(self._buy_eval(), write_ledger=True,
+                      forecast=_StubForecast(horizon=10))
+        rows = list_signals(source="monitor")
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual(row["model_id"], "logreg-win5-abc1234567")
+        self.assertAlmostEqual(row["p_win"], 0.5812, places=6)
+        self.assertAlmostEqual(row["expected_ret"], 0.0123, places=6)
+        self.assertAlmostEqual(row["downside_mae"], -0.031, places=6)
+        self.assertEqual(row["horizon"], 10)  # 跟随模型口径，不再硬编码 5
+
+    def test_ledger_defaults_without_forecast(self):
+        self._consume(self._buy_eval(), write_ledger=True)
+        row = list_signals(source="monitor")[0]
+        self.assertIsNone(row["model_id"])
+        self.assertIsNone(row["p_win"])
+        self.assertIsNone(row["expected_ret"])
+        self.assertIsNone(row["downside_mae"])
+        self.assertEqual(row["horizon"], 5)
+
+    # --- 打分器获取（ML 支线绝不影响收盘例程）---
+    def test_forecast_for_uses_cached_scorer(self):
+        scorer = _StubScorer(_StubForecast())
+        with patch("ripple_tradePilot.ml.scoring.get_scorer", return_value=scorer):
+            result = self.monitor._forecast_for(SYMBOL)
+        self.assertIsNotNone(result)
+        self.assertEqual(scorer.calls[0][0], SYMBOL)
+
+    def test_forecast_for_none_when_no_incumbent(self):
+        with patch("ripple_tradePilot.ml.scoring.get_scorer", return_value=None):
+            self.assertIsNone(self.monitor._forecast_for(SYMBOL))
+
+    def test_forecast_for_swallows_errors(self):
+        with patch("ripple_tradePilot.ml.scoring.get_scorer",
+                   side_effect=ImportError("no sklearn")):
+            self.assertIsNone(self.monitor._forecast_for(SYMBOL))
+        scorer = _StubScorer(error=RuntimeError("joblib 炸了"))
+        with patch("ripple_tradePilot.ml.scoring.get_scorer", return_value=scorer):
+            self.assertIsNone(self.monitor._forecast_for(SYMBOL))
+
+    # --- 收盘例程全链路 ---
+    def test_finalize_writes_forecast_into_ledger(self):
+        self._seed(SYMBOL, 200)
+        self.monitor._stock_service = FakeStockService()
+        forecast = _StubForecast(as_of="20260903")
+        with patch.object(MarketMonitor, "_forecast_for", return_value=forecast):
+            asyncio.run(self.monitor._finalize_after_close("20260904"))
+        rows = list_signals(source="monitor")
+        self.assertTrue(rows)
+        self.assertEqual(rows[0]["model_id"], forecast.model_id)
+        self.assertAlmostEqual(rows[0]["p_win"], forecast.p_win, places=6)
+        self.assertTrue(all(row["provisional"] == 0 for row in rows))
+
+    def test_finalize_without_incumbent_model_still_records(self):
+        # 无在位模型（sklearn 未装 / 门禁全拒）→ 收盘例程照常写台账，四列为空
+        self._seed(SYMBOL, 200)
+        self.monitor._stock_service = FakeStockService()
+        with patch("ripple_tradePilot.ml.scoring.get_scorer", return_value=None):
+            asyncio.run(self.monitor._finalize_after_close("20260904"))
+        rows = list_signals(source="monitor")
+        self.assertTrue(rows)
+        self.assertIsNone(rows[0]["model_id"])
+        self.assertIsNone(rows[0]["p_win"])
 
 
 if __name__ == "__main__":

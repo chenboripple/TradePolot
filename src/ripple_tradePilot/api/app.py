@@ -208,7 +208,26 @@ def _dashboard_for_user(user: Optional[Dict]) -> DashboardService:
             )
         symbols.append(symbol)
     excluded = [item["symbol"] for item in records if not item["is_watched"]]
-    return DashboardService(extra_symbols=symbols, excluded_symbols=excluded)
+    service = DashboardService(extra_symbols=symbols, excluded_symbols=excluded)
+    # D5：注入 ML 预估打分器。用 service.backtest_db（已按 env/探测解析）查 ml_models，
+    # 与看板其余读库口径同一个库文件。
+    service.scorer = _ml_scorer(service.backtest_db)
+    return service
+
+
+def _ml_scorer(db_path):
+    """取 D5 打分器（进程级缓存，在位 model_id 未变则复用已反序列化的工件）。
+
+    **ML 支线的任何失败都退化为 ``None``**：sklearn/joblib 未安装、无 promoted 模型、工件
+    文件损坏、DB 查询异常——看板照常出规则票（``vote_ratio``），只是 ``forecast`` 为 null。
+    """
+    try:
+        from ripple_tradePilot.ml.scoring import get_scorer
+
+        return get_scorer(db_path=db_path)
+    except Exception as exc:
+        logger.warning("ML 打分器不可用，看板降级为仅规则票：%s", exc)
+        return None
 
 
 def _sync_configured_system_strategies():

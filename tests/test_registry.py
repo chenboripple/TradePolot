@@ -368,6 +368,27 @@ class TrainFromDatasetTest(_RegistryBase):
                 "deadbeef0000", "logreg", "win5", db_path=self.db, models_dir=self.models
             )
 
+    def test_back_to_back_retrain_gets_distinct_ids(self):
+        # 同一秒内重训同数据集同协议：秒级戳会算出同一个 model_id → 覆盖上一轮工件，并把
+        # DB 行 upsert 回 candidate。若上一轮已 promote（哪怕是 demo），等于悄悄摘掉在位
+        # 模型——scoring 下一拍就找不到模型了。微秒戳修掉这点，这里钉住行为。
+        first, _ = registry.train_from_dataset(
+            self.manifest.dataset_id, "logreg", "win5",
+            db_path=self.db, models_dir=self.models,
+        )
+        forced = registry.promote(first, force=True, db_path=self.db, models_dir=self.models)
+        self.assertEqual(forced.status, "demo")  # 弱信号 + 数据陈旧 → force 落 demo
+
+        second, _ = registry.train_from_dataset(
+            self.manifest.dataset_id, "logreg", "win5",
+            db_path=self.db, models_dir=self.models,
+        )
+        self.assertNotEqual(first, second)
+        self.assertEqual(db.load_model(first, self.db)["status"], "demo")      # 状态未被覆盖
+        self.assertEqual(db.load_model(second, self.db)["status"], "candidate")
+        self.assertTrue((self.models / first / "meta.json").exists())
+        self.assertTrue((self.models / second / "meta.json").exists())
+
     def test_unknown_target_raises(self):
         with self.assertRaises(ValueError):
             registry.train_from_dataset(

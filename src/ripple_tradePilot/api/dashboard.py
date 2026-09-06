@@ -62,6 +62,7 @@ class DashboardService:
         backtest_db: Optional[Path] = None,
         extra_symbols: Optional[Sequence[Dict[str, Any]]] = None,
         excluded_symbols: Optional[Sequence[str]] = None,
+        scorer: Any = None,
     ):
         self.data_dir = data_dir or Path(os.getenv("TRADEPILOT_DATA_DIR", Path.cwd() / "data"))
         self.config_path = config_path or Path(os.getenv("TRADEPILOT_CONFIG", Path.cwd() / "config.yaml"))
@@ -70,6 +71,11 @@ class DashboardService:
         self.excluded_symbols = {
             str(symbol).upper() for symbol in (excluded_symbols or [])
         }
+        # D5：ML 预估打分器（ml.scoring.SignalScorer，或任何带 score_symbol 的鸭子类型对象）。
+        # None = 不打分，market_detail 的 forecast 恒为 null（前端回退到 vote_ratio）。
+        # 生产由 app.py 注入 ml.scoring.get_scorer() 的进程级缓存实例；无在位模型/sklearn
+        # 未安装时 get_scorer() 本身返回 None，故这里不做任何自动加载（零副作用、可测）。
+        self.scorer = scorer
 
     def _resolve_backtest_db(self) -> Path:
         configured = os.getenv("TRADEPILOT_BACKTEST_DB")
@@ -204,6 +210,25 @@ class DashboardService:
             )
         return bars
 
+    def _forecast(self, symbol_code: str) -> Optional[Dict[str, Any]]:
+        """D5：在位模型的多日预估块；无打分器 / 无数据 / 打分失败 → ``None``。
+
+        ``ml.scoring`` 内部已把所有异常吞成 ``None``（打分支线绝不拖垮信号链路），这里再兜
+        一层——看板不能因为 ML 不可用而 500。返回 ``None`` 时前端只显示"规则票占比 x%
+        （非概率）"，**不回退到任何伪概率文案**。
+        """
+        if self.scorer is None:
+            return None
+        try:
+            result = self.scorer.score_symbol(symbol_code, db_path=self.backtest_db)
+        except Exception:
+            return None
+        if result is None:
+            return None
+        if hasattr(result, "to_dict"):
+            return result.to_dict()
+        return dict(result)
+
     def market_detail(
         self,
         symbol_code: str,
@@ -211,7 +236,15 @@ class DashboardService:
         profile_override: Optional[Dict[str, Any]] = None,
         strategy_profile: Optional[str] = None,
         use_default_strategy: bool = True,
+        with_forecast: bool = True,
     ) -> Dict[str, Any]:
+        """单标的详情（看板/详情页共用）。
+
+        ``with_forecast=False`` 供**列表型**内部调用方（:meth:`dashboard` 逐标的聚合、
+        :meth:`strategy_catalog`）关掉 ML 预估——打分每标的都要重读日线/指数/宽度，在 N 标的
+        循环里是实打实的 N 倍开销，而列表视图并不展示预估。只有详情页
+        （``/api/markets/{symbol}``）付这个成本。
+        """
         symbol = next((item for item in self._symbols() if item["code"] == symbol_code), None)
         if symbol is None:
             raise DashboardDataError(f"未配置标的: {symbol_code}")
@@ -333,6 +366,10 @@ class DashboardService:
             "vote_threshold": latest_decision.vote_threshold,
             "votes": latest_decision.votes,
             "reason": latest_decision.reason,
+            # D5：在位 ML 模型的预估块；null = 无在位模型/该标的无数据/sklearn 未装。
+            # 与 vote_ratio 是**两种不同东西**：vote_ratio 是规则票占比（非概率），
+            # forecast.p_win 才是校准过的概率。前端二者并列展示，绝不互相冒充。
+            "forecast": self._forecast(symbol_code) if with_forecast else None,
             "indicators": {
                 "ma_fast": _component_detail(latest_decision, "ma", "fast_ma"),
                 "ma_slow": _component_detail(latest_decision, "ma", "slow_ma"),
@@ -354,7 +391,8 @@ class DashboardService:
         strategies = []
         for symbol in self._symbols():
             try:
-                item = self.market_detail(symbol["code"])
+                # 列表型调用：关掉 ML 预估（逐标的重读日线/指数/宽度，N 标的即 N 倍开销）
+                item = self.market_detail(symbol["code"], with_forecast=False)
             except DashboardDataError:
                 continue
             strategies.append(
@@ -385,7 +423,8 @@ class DashboardService:
         errors = []
         for symbol in self._symbols():
             try:
-                details.append(self.market_detail(symbol["code"]))
+                # 列表型调用：关掉 ML 预估（同上，聚合视图不展示 forecast）
+                details.append(self.market_detail(symbol["code"], with_forecast=False))
             except DashboardDataError as error:
                 errors.append(
                     {

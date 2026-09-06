@@ -281,6 +281,16 @@ button:disabled { cursor: default; opacity: .55; }
 .indicator-item { padding: 10px; border: 0; border-radius: 6px; background: var(--surface-soft); }
 .indicator-item span { display: block; color: var(--muted); font-size: 9px; }
 .indicator-item strong { display: block; margin-top: 4px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; }
+/* D5：ML 预估块。用 --info 系（青）与买/卖的红绿区分开——它不是方向票，是概率预估 */
+.forecast-block { margin-top: 12px; padding: 12px 13px; border: 1px solid var(--line); border-left: 3px solid var(--info); border-radius: 6px; background: var(--surface-soft); }
+.forecast-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+.forecast-heading span { color: var(--info); font-size: 11px; font-weight: 650; letter-spacing: .04em; }
+.forecast-heading small { color: var(--quiet); font-size: 10px; }
+.forecast-metrics { margin: 8px 0 0; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; color: var(--text); line-height: 1.6; }
+.forecast-basis { margin: 6px 0 0; color: var(--quiet); font-size: 10px; line-height: 1.5; }
+.forecast-warnings { margin: 7px 0 0; padding: 0; list-style: none; }
+.forecast-warnings:empty { display: none; }
+.forecast-warnings li { margin-top: 3px; color: var(--hold); font-size: 10px; line-height: 1.5; }
 .signal-list { margin-top: 10px; }
 .signal-item { display: grid; grid-template-columns: 52px 70px 1fr; align-items: start; gap: 8px; padding: 10px 0; border-bottom: 1px solid var(--line); }
 .signal-item:last-child { border-bottom: 0; }

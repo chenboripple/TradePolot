@@ -9,7 +9,8 @@
 - 回归目标（ret5/mae5）摘要 MAE/R²；
 - ``_summarize`` 与手算一致（base_rate_brier=p̄(1−p̄)）；
 - 入参校验（未知 target/kind、行不匹配、空 splits、一维 X、全折跳过）；
-- **sklearn 懒加载契约**：三模块顶层无 sklearn import（AST 断言）、缺失时清晰报错。
+- **sklearn 懒加载契约**：models/registry/evaluate/scoring/pipeline 五模块顶层无
+  sklearn/joblib import（AST 断言）、缺失时清晰报错。
 """
 
 from __future__ import annotations
@@ -23,7 +24,7 @@ from unittest.mock import patch
 import numpy as np
 import synth
 
-from ripple_tradePilot.ml import calibration, evaluate, models, registry
+from ripple_tradePilot.ml import calibration, evaluate, models, pipeline, registry, scoring
 from ripple_tradePilot.ml.models import TrainResult, _summarize, train_model
 from ripple_tradePilot.ml.splits import rolling_splits
 
@@ -199,7 +200,9 @@ class LazySklearnContractTest(unittest.TestCase):
     """sklearn 懒加载：顶层不 import（AST 断言）+ 缺失时清晰报错。"""
 
     def test_no_toplevel_sklearn_import(self):
-        for mod in (models, registry, evaluate):
+        # scoring（D5）/pipeline（D6）也纳入：前者是 dashboard/monitor 的入口、后者是回归
+        # 入口，sklearn 缺失时都必须能 import（只在真训练处才需要它）
+        for mod in (models, registry, evaluate, scoring, pipeline):
             tree = ast.parse(Path(mod.__file__).read_text(encoding="utf-8"))
             for node in tree.body:  # 仅模块顶层
                 if isinstance(node, ast.Import):
@@ -209,10 +212,11 @@ class LazySklearnContractTest(unittest.TestCase):
                 else:
                     continue
                 tops = [(n or "").split(".")[0] for n in names]
-                self.assertNotIn(
-                    "sklearn", tops,
-                    f"{mod.__name__} 顶层不应 import sklearn（懒加载契约）",
-                )
+                for banned in ("sklearn", "joblib"):
+                    self.assertNotIn(
+                        banned, tops,
+                        f"{mod.__name__} 顶层不应 import {banned}（懒加载契约）",
+                    )
 
     def test_require_sklearn_clear_error_when_missing(self):
         real_import = builtins.__import__

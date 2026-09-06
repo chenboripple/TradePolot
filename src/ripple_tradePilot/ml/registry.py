@@ -104,8 +104,13 @@ def make_model_id(
 
     hash 纳入 dataset_id/训练协议/trained_at，故每次训练 run 产出唯一 candidate（不静默
     覆盖历史），但同一 run 的重复调用稳定。
+
+    未显式给 ``trained_at`` 时用**微秒**精度打戳：秒级精度下"同一秒内重训同数据集同协议"
+    会算出同一个 model_id，于是覆盖上一次的工件、并把 DB 行 upsert 回 ``candidate``——
+    若上一次那个 id 已经 promote 过，等于悄悄摘掉在位模型。显式 ``trained_at``（测试/复现）
+    仍按给定值算，确定性不变。
     """
-    stamp = trained_at or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    stamp = trained_at or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     key = json.dumps(
         {
             "dataset_id": dataset_id,
@@ -285,7 +290,8 @@ def train_from_dataset(
         "trade_dates": [trade_dates[i] for i in oos_idx],
     }
 
-    stamp = trained_at or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    # 微秒戳：见 make_model_id docstring（同秒重训不能撞同一个 model_id）
+    stamp = trained_at or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     model_id = make_model_id(
         dataset_id, kind, target,
         n_splits=n_splits, embargo=embargo, val_ratio=val_ratio, trained_at=stamp,

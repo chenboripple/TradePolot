@@ -118,6 +118,53 @@ class ProfileParsingTest(unittest.TestCase):
         bb = parse_profile({"components": [{"kind": "bollinger", "bb": {"std_dev": 3.0}}]})
         self.assertEqual(bb.components[0].params["num_std"], 3.0)
 
+    def test_components_nested_params_roundtrip(self):
+        """canonical 组件形态 ``{"name","kind","params":{...}}`` 必须无损读回。
+
+        回归：``_component_params`` 曾只看 kind 同名嵌套节与容器直接键，忽略 ``params``
+        子节 → 整组参数静默回落默认值。D5 serve 端据此还原训练画像快照
+        （``ml/dataset._spec_snapshot`` 产的正是这个形态），漏读就是 train/serve 偏斜。
+        """
+        spec = parse_profile(
+            {
+                "kind": "combo_vote",
+                "vote_threshold": 2,
+                "components": [
+                    {"name": "ma", "kind": "ma", "params": {"fast": 5, "slow": 10}},
+                    {"name": "rsi", "kind": "rsi",
+                     "params": {"period": 7, "oversold": 25, "overbought": 75}},
+                    {"name": "bollinger", "kind": "bollinger",
+                     "params": {"period": 26, "num_std": 2.5}},
+                ],
+            },
+            source="dataset",
+        )
+        params = {c.name: c.params for c in spec.components}
+        self.assertEqual(params["ma"], {"fast": 5, "slow": 10})
+        self.assertEqual(params["rsi"], {"period": 7, "oversold": 25.0, "overbought": 75.0})
+        self.assertEqual(params["bollinger"], {"period": 26, "num_std": 2.5})
+        self.assertEqual(spec.vote_threshold, 2)
+
+        # 单策略画像同样支持 params 子节
+        single = parse_profile({"kind": "ma", "params": {"fast": 4, "slow": 9}})
+        self.assertEqual(single.components[0].params, {"fast": 4, "slow": 9})
+
+        # 再解析一次（快照 → spec → 快照 → spec）仍稳定，不会逐次漂回默认值
+        again = parse_profile(
+            {
+                "kind": spec.kind,
+                "vote_threshold": spec.vote_threshold,
+                "components": [
+                    {"name": c.name, "kind": c.kind, "params": dict(c.params)}
+                    for c in spec.components
+                ],
+            },
+            source="dataset",
+        )
+        self.assertEqual(
+            [c.params for c in again.components], [c.params for c in spec.components]
+        )
+
     def test_breakout_raises_unsupported(self):
         with self.assertRaises(UnsupportedProfileKindError) as ctx:
             parse_profile({"kind": "breakout", "breakout_window": 20})

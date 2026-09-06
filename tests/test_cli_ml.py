@@ -1,7 +1,8 @@
-"""D3/D4 CLI 集成测试（``tradepilot ml datasets/train/list/promote/eval``）。
+"""D3/D4/D6 CLI 集成测试（``tradepilot ml datasets/train/list/promote/eval/pipeline``）。
 
 在 seed_market_db 合成库上跑通**全链路**（plan 阶段 D 验收第 1 条）：build-dataset →
-train(logreg/hgb/回归) → list → eval → promote（门禁拒 + force 双路径），零网络。
+train(logreg/hgb/回归) → list → eval → promote（门禁拒 + force 双路径），零网络；
+D6 的 ``ml pipeline`` 把同一串动作收成一个命令，本文件末尾按同样口径验它。
 合成数据是随机游走弱信号 + 停在 2025-02（陈旧），故 promote 默认拒、force 落 demo——
 这正是"数据恢复前演示模型不冒充可用模型"护栏的预期表现。dataset_id/model_id 一律从
 DB 读回（不解析 stdout），断言只看稳定子串。
@@ -218,7 +219,7 @@ class PromoteCommandTest(CliMlBase):
         mid = self._train(ds)
         r = self.runner.invoke(cli, ["ml", "promote", mid, "--force", "--models-dir", str(self.models)])
         self.assertEqual(r.exit_code, 0, r.output)
-        self.assertIn("🎖️", r.output)
+        self.assertIn("🎭", r.output)  # demo 不给奖章图标（与真在位区分）
         # 弱信号（不跑赢基线）+ 陈旧 → force 落 demo + stale
         row = db.load_model(mid, self.db)
         self.assertEqual(row["status"], "demo")
@@ -264,6 +265,138 @@ class FullPipelineTest(CliMlBase):
         # eval 反映晋升后状态（demo + stale 警告）
         r_eval2 = self.runner.invoke(cli, ["ml", "eval", "--model", mid_lr, "--models-dir", str(self.models)])
         self.assertIn("演示模型", r_eval2.output)
+
+
+class PipelineCommandTest(CliMlBase):
+    """D6：``ml pipeline`` 把 build→train→eval→〔promote〕→markdown 收成一个命令。
+
+    一律 ``--pool config``（合成 config 只 1 只标的）+ ``--models logreg --aux-targets ''``：
+    管道语义由 tests/test_pipeline.py 精确覆盖，这里只验 CLI 的接线、退出码与产物落盘。
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.reports = Path(self._tmp.name) / "reports"
+
+    def _run(self, *extra):
+        r = self.runner.invoke(cli, [
+            "ml", "pipeline", "--pool", "config",
+            "--models", "logreg", "--aux-targets", "",
+            "--out-dir", str(self.out), "--models-dir", str(self.models),
+            "--report-dir", str(self.reports), *extra,
+        ])
+        self.assertEqual(r.exit_code, 0, r.output)
+        return r
+
+    def _report(self):
+        files = sorted(self.reports.glob("ml-pipeline-*.md"))
+        self.assertEqual(len(files), 1, files)
+        return files[0]
+
+    def test_pipeline_end_to_end(self):
+        r = self._run()
+        for token in ("ML 全管道（D6）", "训练 logreg/win5", "评估 logreg-win5-",
+                      "主模型", "管道报告", "未请求晋升"):
+            self.assertIn(token, r.output)
+        datasets = db.list_datasets(self.db)
+        self.assertEqual(len(datasets), 1)
+        models = db.list_models(self.db)
+        self.assertEqual([m["status"] for m in models], ["candidate"])  # 默认不晋升
+        self.assertTrue(models[0]["model_id"].startswith("logreg-win5-"))
+        self.assertEqual(models[0]["dataset_id"], datasets[0]["dataset_id"])
+        self.assertEqual(self._report().name, f"ml-pipeline-{datasets[0]['dataset_id']}.md")
+
+    def test_pipeline_report_sections(self):
+        self._run()
+        text = self._report().read_text(encoding="utf-8")
+        for token in ("# ML 信号质量管道报告", "| kind | target | model_id |",
+                      "## 决策对比", "rule_baseline", "buy_hold", "index",
+                      "## 晋升门禁", "本次未请求晋升", "## 警告", "## 诚实定位",
+                      "演示工件不可作为交易依据", "锚定滚动"):
+            self.assertIn(token, text)
+
+    def test_pipeline_warnings_keep_own_severity_marker(self):
+        # evaluate 的硬警告自带 ⚠️、口径提示自带（…）；CLI 只给裸串补 ⚠️，
+        # 否则叠成"⚠️ ⚠️"或把口径提示误标成硬警告
+        r = self._run()
+        self.assertNotIn("⚠️ ⚠️", r.output)
+        self.assertNotIn("⚠️ （", r.output)
+        self.assertIn("⚠️", r.output)  # 弱信号 → 至少一条硬警告（未跑赢基线）
+
+    def test_pipeline_default_leaves_incumbent_untouched(self):
+        self._run()
+        r = self.runner.invoke(cli, ["ml", "list", "--status", "promoted"])
+        self.assertIn("无模型", r.output)
+        r2 = self.runner.invoke(cli, ["ml", "list", "--status", "demo"])
+        self.assertIn("无模型", r2.output)
+
+    def test_pipeline_promote_force_flags_demo(self):
+        r = self._run("--promote", "--force")
+        self.assertIn("🎭", r.output)  # demo 不给奖章图标
+        self.assertIn("demo", r.output)
+        row = db.list_models(self.db)[0]
+        self.assertEqual(row["status"], "demo")
+        self.assertTrue(row["stale"])
+        text = self._report().read_text(encoding="utf-8")
+        self.assertIn("force 放行", text)
+        self.assertNotIn("本次未请求晋升", text)
+
+    def test_pipeline_promote_without_force_is_rejected_but_exits_0(self):
+        # 门禁拒不是 CLI 故障：报告照写、退出码照 0（与 ml promote 的 exit 1 语义区分）
+        r = self._run("--promote")
+        self.assertIn("⛔", r.output)
+        self.assertIn("max_staleness", r.output)  # 合成数据停在 2025-02 → 新鲜度门必触发
+        self.assertEqual(db.list_models(self.db)[0]["status"], "candidate")
+
+    def test_pipeline_aux_targets_and_classification_only_eval(self):
+        r = self.runner.invoke(cli, [
+            "ml", "pipeline", "--pool", "config", "--models", "logreg", "--aux-targets", "ret5",
+            "--out-dir", str(self.out), "--models-dir", str(self.models),
+            "--report-dir", str(self.reports),
+        ])
+        self.assertEqual(r.exit_code, 0, r.output)
+        self.assertEqual(
+            [m["target"] for m in sorted(db.list_models(self.db), key=lambda r: r["model_id"])],
+            ["ret5", "win5"],
+        )
+        self.assertIn("评估 1 份", r.output)  # 回归目标不进决策对比表（AUC/Brier 无意义）
+        self.assertNotIn("评估 logreg-ret5-", r.output)
+
+    def test_pipeline_groups_switch_narrows_columns(self):
+        r = self._run("--groups", "signal,price_volume")
+        self.assertIn("组 signal,price_volume", r.output)
+        text = self._report().read_text(encoding="utf-8")
+        match = re.search(r"特征组：signal,price_volume（(\d+) 列）", text)
+        self.assertIsNotNone(match, text)
+        self.assertLess(int(match.group(1)), 40)  # 全组在合成库上是 40 列
+
+    def test_pipeline_custom_threshold(self):
+        self._run("--threshold", "0.7")
+        text = self._report().read_text(encoding="utf-8")
+        self.assertIn("model_thr0.70", text)
+        self.assertNotIn("model_thr0.50", text)
+
+    def test_pipeline_symbols_override_pool(self):
+        r = self._run("--symbols", "600309.SH,601816.SH")
+        self.assertIn("2 标的", r.output)
+
+    def test_pipeline_unknown_model_exit_2_before_building(self):
+        r = self.runner.invoke(cli, ["ml", "pipeline", "--pool", "config", "--models", "xgb"])
+        self.assertEqual(r.exit_code, 2)
+        self.assertIn("未知模型 kind", r.output)
+        self.assertEqual(db.list_datasets(self.db), [])  # 校验在副作用之前
+
+    def test_pipeline_unknown_group_exit_2(self):
+        r = self.runner.invoke(
+            cli, ["ml", "pipeline", "--pool", "config", "--groups", "signal,astrology"]
+        )
+        self.assertEqual(r.exit_code, 2)
+        self.assertIn("未知特征组", r.output)
+
+    def test_pipeline_empty_pool_exit_2(self):
+        r = self.runner.invoke(cli, ["ml", "pipeline", "--pool", "watchlist"])
+        self.assertEqual(r.exit_code, 2)
+        self.assertIn("无标的", r.output)
 
 
 if __name__ == "__main__":

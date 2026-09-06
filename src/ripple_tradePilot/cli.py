@@ -850,9 +850,48 @@ def signals_list(status, source, symbol, limit):
         )
 
 
+def _resolve_symbol_pool(pool: str, symbols: str = None) -> list:
+    """解析股票池（``ml build-dataset`` / ``ml pipeline`` 共用，避免两处口径漂移）。
+
+    优先级：显式 ``--symbols`` > ``--pool``（config.yaml symbols / Web 观察池 / 库内全部标的）。
+    """
+    if symbols:
+        return [s.strip() for s in symbols.split(',') if s.strip()]
+    if pool == 'watchlist':
+        from .storage.user_store import list_all_watched_symbols
+        return [str(item['symbol']) for item in list_all_watched_symbols()
+                if item.get('symbol')]
+    if pool == 'catalog':
+        from .storage.database import list_daily_bar_symbols
+        return list(list_daily_bar_symbols())
+    cfg = load_config()
+    return [str(s.get('code')) for s in cfg.get('symbols', []) if s.get('code')]
+
+
+def _promotion_icon(status: str) -> str:
+    """晋升结果图标（``ml promote`` / ``ml pipeline`` 共用）：在位 🎖️ / 演示 🎭 / 未放行 ⛔。
+
+    ``demo`` 不给奖章——它是 force 放行的演示工件，``load_promoted`` 默认不取，
+    图标上就该和真在位模型区分开，否则一眼看过去像"晋升成功了"。
+    """
+    return {"promoted": "🎖️", "demo": "🎭"}.get(status, "⛔")
+
+
+def _parse_feature_groups(groups: str) -> tuple:
+    """``--groups`` 逗号串 → 合法特征组元组；有未知组则报错退出（exit 2）。"""
+    from .ml.features import FEATURE_GROUPS
+
+    parsed = tuple(g.strip() for g in groups.split(',') if g.strip())
+    bad_groups = [g for g in parsed if g not in FEATURE_GROUPS]
+    if bad_groups:
+        click.echo(f"未知特征组：{bad_groups}；合法值 {list(FEATURE_GROUPS)}", err=True)
+        sys.exit(2)
+    return parsed
+
+
 @cli.group()
 def ml():
-    """ML 信号质量模型（数据集构建 → 训练 → 评估 → 晋升；D 阶段）"""
+    """ML 信号质量模型（数据集构建 → 训练 → 评估 → 晋升 → 一键管道；D 阶段）"""
 
 
 @ml.command('build-dataset')
@@ -875,29 +914,10 @@ def ml_build_dataset(pool, symbols, start, end, horizon, aux_horizon, groups,
     逐标的过 A9 复权巡检（混接嫌疑拒入并记录）；行业成分为最新单快照，manifest 标
     ``industry_point_in_time=False`` 前视警告。同库同参数重跑 → 同 dataset_id（幂等）。
     """
-    from pathlib import Path
-
     from .ml.dataset import build_dataset
-    from .ml.features import FEATURE_GROUPS
 
-    if symbols:
-        symbol_list = [s.strip() for s in symbols.split(',') if s.strip()]
-    elif pool == 'watchlist':
-        from .storage.user_store import list_all_watched_symbols
-        symbol_list = [str(item['symbol']) for item in list_all_watched_symbols()
-                       if item.get('symbol')]
-    elif pool == 'catalog':
-        from .storage.database import list_daily_bar_symbols
-        symbol_list = list_daily_bar_symbols()
-    else:
-        cfg = load_config()
-        symbol_list = [str(s.get('code')) for s in cfg.get('symbols', []) if s.get('code')]
-
-    group_list = tuple(g.strip() for g in groups.split(',') if g.strip())
-    bad_groups = [g for g in group_list if g not in FEATURE_GROUPS]
-    if bad_groups:
-        click.echo(f"未知特征组：{bad_groups}；合法值 {list(FEATURE_GROUPS)}", err=True)
-        sys.exit(2)
+    symbol_list = _resolve_symbol_pool(pool, symbols)
+    group_list = _parse_feature_groups(groups)
     if not symbol_list:
         click.echo(f"⚠️ 股票池（--pool {pool}）无标的，无法构建数据集", err=True)
         sys.exit(2)
@@ -1076,7 +1096,7 @@ def ml_promote(model_id, force, min_samples, min_positives, max_staleness, model
         click.echo(f"❌ {exc}", err=True)
         sys.exit(2)
 
-    icon = "🎖️" if report.promoted else "⛔"
+    icon = _promotion_icon(report.status)
     click.echo(
         f"\n{icon} {model_id} → {report.status}{'（stale）' if report.stale else ''}"
         f"{'（force）' if report.forced else ''}"
@@ -1117,6 +1137,109 @@ def ml_eval(model_id, threshold, index_code, json_path, models_dir):
     if json_path:
         dump_json(report, json_path)
         click.echo(f"   📄 JSON 报告：{json_path}")
+
+
+@ml.command('pipeline')
+@click.option('--pool', type=click.Choice(['config', 'watchlist', 'catalog']), default='config',
+              help='股票池来源（同 ml build-dataset）')
+@click.option('--symbols', default=None, help='显式标的（逗号分隔，覆盖 --pool）')
+@click.option('--start', default=None, help='决策日起点 YYYYMMDD（含）')
+@click.option('--end', default=None, help='决策日终点 YYYYMMDD（含）')
+@click.option('--horizon', type=int, default=5, help='主前瞻标签天数')
+@click.option('--aux-horizon', type=int, default=10, help='辅助前瞻标签天数')
+@click.option('--groups', default='signal,price_volume,market,industry',
+              help='启用特征组（逗号分隔；同 ml build-dataset）')
+@click.option('--index-code', default='000300.SH', help='market 组基准指数 + 决策表指数同窗')
+@click.option('--models', 'kinds', default='logreg,hgb', help='训练哪些模型（逗号分隔）')
+@click.option('--target', type=click.Choice(['win5', 'ret5', 'mae5']), default='win5',
+              help='主目标（决策对比表只对分类目标出）')
+@click.option('--aux-targets', default='ret5,mae5', help='辅助目标（逗号分隔；空串=只训主目标）')
+@click.option('--splits', type=int, default=5, help='锚定滚动 OOS 折数')
+@click.option('--embargo', type=int, default=2, help='purge 后再空的交易日数')
+@click.option('--val-ratio', type=float, default=0.2, help='验证折占训练段比例（选参/校准）')
+@click.option('--threshold', type=float, multiple=True,
+              help='决策表阈值（可多次；默认 0.5/0.55/0.6）')
+@click.option('--out-dir', default=None, help='数据集输出目录（默认 data/ml）')
+@click.option('--models-dir', default=None, help='工件输出目录（默认 data/ml/models）')
+@click.option('--report-dir', default='reports', show_default=True, help='markdown 报告输出目录')
+@click.option('--promote', is_flag=True,
+              help='跑完对每个模型过晋升门禁（默认不晋升，在位模型不受影响）')
+@click.option('--force', is_flag=True, help='与 --promote 连用：门禁不过也放行（打 stale/demo 标记）')
+def ml_pipeline(pool, symbols, start, end, horizon, aux_horizon, groups, index_code,
+                kinds, target, aux_targets, splits, embargo, val_ratio, threshold,
+                out_dir, models_dir, report_dir, promote, force):
+    """一键跑通 D 阶段全管道（D6）：build-dataset → train → eval →〔可选〕promote → markdown。
+
+    演示与回归入口：数据恢复并扩池后重跑本命令，才会产生第一个能过门禁的在位模型。
+    **默认不晋升**（要动在位模型须显式 --promote），以免一次回归跑悄悄换掉看板/监控正在用的
+    模型。退出码：2=空池/非法参数，3=sklearn 未装，0=跑通（哪怕门禁未过）。
+    """
+    from .ml.evaluate import DEFAULT_THRESHOLDS
+    from .ml.pipeline import MODEL_KINDS, collect_warnings, fmt_number, run_pipeline, write_report
+
+    symbol_list = _resolve_symbol_pool(pool, symbols)
+    if not symbol_list:
+        click.echo(f"⚠️ 股票池（--pool {pool}）无标的，无法跑管道", err=True)
+        sys.exit(2)
+    group_list = _parse_feature_groups(groups)
+    kind_list = tuple(k.strip() for k in kinds.split(',') if k.strip())
+    bad_kinds = [k for k in kind_list if k not in MODEL_KINDS]
+    if bad_kinds:
+        click.echo(f"未知模型 kind：{bad_kinds}；合法值 {list(MODEL_KINDS)}", err=True)
+        sys.exit(2)
+    aux_list = tuple(t.strip() for t in aux_targets.split(',') if t.strip())
+
+    click.echo(
+        f"\n🔁 ML 全管道（D6）：{len(symbol_list)} 标的 · 组 {','.join(group_list)} · "
+        f"模型 {','.join(kind_list)} · 目标 {target}"
+        f"{'+' + ','.join(aux_list) if aux_list else ''}"
+    )
+    try:
+        report = run_pipeline(
+            symbol_list,
+            start=start, end=end, horizon=horizon, aux_horizon=aux_horizon,
+            groups=group_list, index_code=index_code,
+            kinds=kind_list, target=target, aux_targets=aux_list,
+            n_splits=splits, embargo=embargo, val_ratio=val_ratio,
+            thresholds=tuple(threshold) if threshold else DEFAULT_THRESHOLDS,
+            out_dir=Path(out_dir) if out_dir else None,
+            models_dir=Path(models_dir) if models_dir else None,
+            promote_models=promote, force=force,
+            progress=lambda message: click.echo(f"   {message}"),
+        )
+    except ImportError as exc:
+        click.echo(f"❌ {exc}", err=True)
+        sys.exit(3)
+    except (FileNotFoundError, ValueError) as exc:
+        click.echo(f"❌ {exc}", err=True)
+        sys.exit(2)
+
+    click.echo(f"\n📋 数据集 {report.dataset_id} · 模型 {len(report.trained)} 个"
+               f" · 评估 {len(report.evaluations)} 份")
+    primary = report.primary
+    if primary is not None:
+        click.echo(
+            f"   主模型 {primary.model_id}：AUC {fmt_number(primary.auc)} · "
+            f"Brier {fmt_number(primary.brier)}（基线 {fmt_number(primary.base_rate_brier)}）· "
+            f"{'✓ 跑赢' if primary.beats_base_rate else '✗ 未跑赢'}常数基线"
+        )
+    if report.promotions:
+        for outcome in report.promotions:
+            icon = _promotion_icon(outcome.status)
+            click.echo(f"   {icon} 晋升 {outcome.model_id} → {outcome.status}"
+                       f"{'（stale）' if outcome.stale else ''}")
+    else:
+        click.echo("   （未请求晋升：模型停在 candidate，看板/监控的在位模型未受影响）")
+    warnings = collect_warnings(report)
+    for warning in warnings[:8]:
+        # 警告自带严重度标记：evaluate 的硬警告以 ⚠️ 起头、口径提示以（…）起头，manifest
+        # 的则是裸串。只给裸串补 ⚠️，否则会叠成"⚠️ ⚠️"或把口径提示误标成硬警告。
+        prefix = "" if (warning.startswith("⚠️") or warning.startswith("（")) else "⚠️ "
+        click.echo(f"   {prefix}{warning}")
+    if len(warnings) > 8:
+        click.echo(f"   …另 {len(warnings) - 8} 条见报告")
+    path = write_report(report, Path(report_dir))
+    click.echo(f"\n📄 管道报告：{path}")
 
 
 @cli.command()

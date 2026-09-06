@@ -1084,8 +1084,43 @@ function renderMarket() {
     ["布林中轨", indicators.bb_middle],
   ].map(([label, value]) => `<div class="indicator-item"><span>${label}</span><strong>${formatNumber(value)}</strong></div>`).join("");
 
+  renderForecast(market.forecast);
   renderSignals(market.signals);
   drawChart();
+}
+
+// D5：在位 ML 模型的预估块。forecast 为 null（无在位模型 / sklearn 未装 / 该标的无数据）
+// 时整块隐藏——页面只剩上面的"规则票占比 x%（非概率）"，绝不拿票占比冒充胜率。
+function renderForecast(forecast) {
+  const block = document.querySelector("#forecast-block");
+  if (!forecast || forecast.p_win === null || forecast.p_win === undefined) {
+    block.hidden = true;
+    return;
+  }
+  block.hidden = false;
+
+  document.querySelector("#forecast-horizon").textContent =
+    `${forecast.horizon_days} 日 · 基准日 ${forecast.as_of || "--"}`;
+
+  // 三段指标各自独立可缺：没有 ret5/mae5 在位模型时对应字段为 null，直接省略该段，
+  // 不显示 0.00%（那会被读成"预测不涨不跌"，是撒谎）。
+  const metrics = [`胜率 ${formatPercent(forecast.p_win, 1)}`];
+  if (forecast.expected_net_return !== null && forecast.expected_net_return !== undefined) {
+    metrics.push(`期望净收益 ${formatPercent(forecast.expected_net_return, 2, true)}`);
+  }
+  if (forecast.downside_mae !== null && forecast.downside_mae !== undefined) {
+    metrics.push(`参考下行 ${formatPercent(forecast.downside_mae, 2)}`);
+  }
+  document.querySelector("#forecast-metrics").textContent = metrics.join(" · ");
+
+  const basis = document.querySelector("#forecast-basis");
+  basis.textContent = forecast.return_basis
+    ? `${forecast.return_basis} · 模型 ${forecast.model_id}`
+    : `模型 ${forecast.model_id}`;
+
+  document.querySelector("#forecast-warnings").innerHTML = (forecast.warnings || [])
+    .map((warning) => `<li>${warning}</li>`)
+    .join("");
 }
 
 function renderSignals(signals) {

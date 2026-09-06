@@ -138,11 +138,35 @@ class SignalNotifier:
     def record_alert(self, symbol: str, kind: str, trade_date: str) -> None:
         self._sent_alerts.add((symbol, kind, str(trade_date)))
 
+    @staticmethod
+    def _forecast_text(forecast: Any) -> str:
+        """D5 预估的文本块（控制台/微信/钉钉模板用）；无预估 → 空串。
+
+        与 ``vote_text`` **并列而非合并**：票占比不是概率、模型胜率才是概率，两者挤在一行
+        必被误读成同一个东西。缺 ``ret5``/``mae5`` 在位模型时对应段直接省略（不写 0.00%——
+        那会被读成"预测不涨不跌"）。
+        """
+        if forecast is None or getattr(forecast, "p_win", None) is None:
+            return ""
+        parts = [f"胜率 {forecast.p_win:.1%}"]
+        if forecast.expected_net_return is not None:
+            parts.append(f"期望净收益 {forecast.expected_net_return:+.2%}")
+        if forecast.downside_mae is not None:
+            parts.append(f"参考下行 {forecast.downside_mae:.2%}")
+        flag = "（演示模型，非可信在位）" if forecast.status == "demo" else ""
+        return (
+            f"\n🧠 模型预估（{forecast.horizon_days}日 · 基准 {forecast.as_of}）："
+            f"{' · '.join(parts)}{flag}"
+        )
+
     def send(self, symbol: str, name: str, side: Side, price: float, strategy: str, bar: Bar,
              provisional: bool = False, trigger_components: Tuple[str, ...] = (),
              buy_count: Optional[int] = None, sell_count: Optional[int] = None,
-             vote_threshold: Optional[int] = None):
-        """发送个股信号通知（仅由当日新边沿事件触发；strongest_signal 降级为"触发组件"注解）。"""
+             vote_threshold: Optional[int] = None, forecast: Any = None):
+        """发送个股信号通知（仅由当日新边沿事件触发；strongest_signal 降级为"触发组件"注解）。
+
+        ``forecast`` 为 D5 :class:`ml.scoring.ScoreResult`（或 None）：仅收盘例程传入。
+        """
         hints = self._risk_hints(side, price)
         vote_text = ""
         if buy_count is not None and sell_count is not None and vote_threshold:
@@ -151,6 +175,7 @@ class SignalNotifier:
         if trigger_components:
             trigger_text = f"\n🔧 触发组件：{', '.join(trigger_components)}"
         provisional_text = "\n⏳ 盘中预估（未收盘，以收盘确认为准）" if provisional else "\n✅ 收盘确认"
+        forecast_text = self._forecast_text(forecast)
         risk_block = ""
         if hints:
             risk_block = (
@@ -165,7 +190,7 @@ class SignalNotifier:
 📈 信号：{side.value}
 💰 价格：{price:.2f} 元
 📉 画像：{strategy}
-⏰ 交易日：{bar.timestamp.strftime('%Y-%m-%d')}{provisional_text}{vote_text}{trigger_text}
+⏰ 交易日：{bar.timestamp.strftime('%Y-%m-%d')}{provisional_text}{vote_text}{trigger_text}{forecast_text}
 ━━━━━━━━━━━━━━━━
 
 📝 信号详情：
@@ -199,6 +224,13 @@ class SignalNotifier:
                     note_parts.append("触发组件：" + ", ".join(trigger_components))
                 if note_parts:
                     extra_info['note'] = "；".join(note_parts)
+                # D5：预估块交给飞书卡片渲染（feishu.py 认 extra_info['forecast']）。
+                # 单独 try——预估是增强项，它序列化出错不该让整条信号通知被外层 except 吞掉
+                if forecast is not None and hasattr(forecast, "to_dict"):
+                    try:
+                        extra_info['forecast'] = forecast.to_dict()
+                    except Exception as e:
+                        logger.warning(f"{symbol} 预估块序列化失败，通知照发但不带预估：{e}")
                 self.feishu.send(
                     symbol=symbol, name=name, side=side,
                     price=price, strategy=strategy, bar=bar,
@@ -567,8 +599,14 @@ class MarketMonitor:
 
     def _consume_evaluation(self, symbol: str, name: str, profile_name: Optional[str],
                             evaluation: DailyEvaluation, results: Optional[list],
-                            *, write_ledger: bool, data_version: Optional[str]):
-        """统一口径评估结果 → 通知门控 + 台账 + 汇总记录（盘中/收盘共用）。"""
+                            *, write_ledger: bool, data_version: Optional[str],
+                            forecast: Any = None):
+        """统一口径评估结果 → 通知门控 + 台账 + 汇总记录（盘中/收盘共用）。
+
+        ``forecast`` 是 D5 :class:`ml.scoring.ScoreResult`（或 None）：仅收盘例程传入——
+        盘中不打分，因为特征只认**已入库的收盘 bar**，用 provisional bar 打分会给出一个
+        基准日是昨天的预估，反而误导。
+        """
         decision = evaluation.decision
         recommendation = _display_recommendation(decision.recommendation, decision.vote_threshold)
 
@@ -584,6 +622,7 @@ class MarketMonitor:
                     trigger_components=evaluation.trigger_components,
                     buy_count=decision.buy_count, sell_count=decision.sell_count,
                     vote_threshold=decision.vote_threshold,
+                    forecast=forecast,
                 )
                 self.notifier.record(symbol, side, evaluation.trade_date, evaluation.provisional)
             else:
@@ -594,7 +633,8 @@ class MarketMonitor:
 
         # 台账：盘中 provisional=1（预估），收盘 provisional=0（确认）
         if write_ledger:
-            self._record_ledger(symbol, evaluation, profile_name, data_version=data_version)
+            self._record_ledger(symbol, evaluation, profile_name,
+                                data_version=data_version, forecast=forecast)
 
         if results is not None:
             results.append({
@@ -610,8 +650,14 @@ class MarketMonitor:
         )
 
     def _record_ledger(self, symbol: str, evaluation: DailyEvaluation,
-                       profile_name: Optional[str], data_version: Optional[str] = None):
-        """把决策写入 B2 信号台账（provisional 跟随评估：盘中=1，收盘确认=0）。"""
+                       profile_name: Optional[str], data_version: Optional[str] = None,
+                       forecast: Any = None):
+        """把决策写入 B2 信号台账（provisional 跟随评估：盘中=1，收盘确认=0）。
+
+        有 D5 预估时一并回填 ``model_id``/``p_win``/``expected_ret``/``downside_mae`` 四列
+        （B2 建表时已预留）——台账因此既能算规则票的胜率，也能**按 model_id 分组算模型的
+        实际命中率**，这是 D 阶段闭环的最后一环。
+        """
         if evaluation.decision is None:
             return
         try:
@@ -620,12 +666,34 @@ class MarketMonitor:
                 source="monitor",
                 provisional=1 if evaluation.provisional else 0,
                 profile_name=profile_name or "default",
-                horizon=5,
+                horizon=forecast.horizon_days if forecast is not None else 5,
                 data_version=data_version,
                 trade_date=evaluation.trade_date,
+                model_id=forecast.model_id if forecast is not None else None,
+                p_win=forecast.p_win if forecast is not None else None,
+                expected_ret=forecast.expected_net_return if forecast is not None else None,
+                downside_mae=forecast.downside_mae if forecast is not None else None,
             )
         except Exception as e:
             logger.debug(f"{symbol} 台账写入失败（不影响监控）：{e}")
+
+    def _forecast_for(self, symbol: str) -> Any:
+        """D5：取在位 ML 模型对该标的的预估；不可用则 ``None``（通知不带预估块）。
+
+        打分器走 :func:`ml.scoring.get_scorer` 的进程级缓存——每轮只多一次廉价 DB 查询，
+        在位 model_id 未变则复用已反序列化的工件。sklearn 未装 / 无 promoted 模型 / 工件
+        损坏 / 任何异常都退化为 ``None``：**ML 支线绝不影响收盘例程**。
+        """
+        try:
+            from ..ml.scoring import get_scorer
+
+            scorer = get_scorer()
+            if scorer is None:
+                return None
+            return scorer.score_symbol(symbol)
+        except Exception as e:
+            logger.debug(f"{symbol} ML 预估不可用（不影响监控）：{e}")
+            return None
 
     def _check_breakout(self, symbol: str, name: str, profile_name: Optional[str],
                         profile: dict, results: Optional[list], quote: Optional[Dict[str, Any]]):
@@ -881,17 +949,22 @@ class MarketMonitor:
                 logger.warning(f"{symbol} 收盘重评数据不足（{evaluation.n_bars} 根），跳过。")
                 continue
 
+            # 4) D5 ML 预估（仅收盘路径；失败/无在位模型 → None，通知不带预估块）
+            #    放在重评之后、_consume_evaluation 之前，才能同时进通知卡片与台账四列
+            forecast = self._forecast_for(symbol)
+
             self._consume_evaluation(symbol, name, profile_name, evaluation, results,
-                                     write_ledger=True, data_version=data_version)
+                                     write_ledger=True, data_version=data_version,
+                                     forecast=forecast)
 
         self._rebase_watch.clear()
 
-        # 4) 收盘汇总报告
+        # 5) 收盘汇总报告
         if results and self._should_send_report(results):
             await self.send_periodic_report(results)
             self._last_report_at = datetime.now()
 
-        # 5) C5：市场级数据落库（宽度/指数/可选行业），独立于个股通知，单项失败不影响其他
+        # 6) C5：市场级数据落库（宽度/指数/可选行业），独立于个股通知，单项失败不影响其他
         self._finalize_market_data(today, symbols)
 
     def _finalize_market_data(self, today: str, symbols: List[dict]) -> None:

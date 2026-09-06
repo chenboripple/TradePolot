@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#f4f6f8">
   <title>TradePilot 交易监控台</title>
-  <link rel="stylesheet" href="/assets/app.css?v=19">
+  <link rel="stylesheet" href="/assets/app.css?v=20">
 </head>
 <body>
   <header class="topbar">
@@ -172,6 +172,17 @@
               <p class="decision-reason" id="decision-reason">--</p>
               <div class="vote-grid" id="vote-grid"></div>
               <div class="indicator-row" id="indicator-row"></div>
+              <!-- D5：在位 ML 模型的预估块。hidden 时页面只剩"规则票占比 x%（非概率）"，
+                   绝不回退成任何伪概率文案——没有模型就明说没有。 -->
+              <div class="forecast-block" id="forecast-block" hidden>
+                <div class="forecast-heading">
+                  <span>模型预估</span>
+                  <small id="forecast-horizon">--</small>
+                </div>
+                <p class="forecast-metrics" id="forecast-metrics">--</p>
+                <p class="forecast-basis" id="forecast-basis"></p>
+                <ul class="forecast-warnings" id="forecast-warnings"></ul>
+              </div>
             </section>
 
             <section class="signal-panel">
@@ -410,6 +421,6 @@
 
   <div class="toast-container" id="toast-container" aria-live="polite"></div>
 
-  <script src="/assets/app.js?v=19" defer></script>
+  <script src="/assets/app.js?v=20" defer></script>
 </body>
 </html>

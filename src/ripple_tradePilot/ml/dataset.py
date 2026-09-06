@@ -64,9 +64,13 @@ __all__ = [
     "DatasetManifest",
     "LABEL_COLUMNS",
     "DEFAULT_ML_DIR",
+    "MarketInputs",
+    "SymbolFeatures",
     "build_dataset",
     "load_dataset_frame",
     "load_dataset",
+    "load_symbol_features",
+    "resolve_spec",
 ]
 
 # 标签/元数据列（非特征）；D3 训练时据此区分 X 与 y。
@@ -157,10 +161,22 @@ def load_dataset(
     return manifest, load_dataset_frame(csv_path)
 
 
-def _resolve_spec(
-    symbol: str, profile_resolver: Optional[ProfileResolver]
+def resolve_spec(
+    symbol: str,
+    profile_resolver: Optional[ProfileResolver] = None,
+    snapshot: Optional[Mapping[str, Any]] = None,
 ) -> ProfileSpec:
-    """按解析器把 symbol 映射为 ProfileSpec；解析器缺省/返回 None 时用全局默认三件套。"""
+    """把 symbol 解析为 signal 组用的 :class:`ProfileSpec`（train/serve 共用）。
+
+    优先级：``snapshot``（**serve** 路径——训练时记在 manifest.profile_snapshot[symbol]["spec"]
+    里的画像快照，保证线上打分与训练用同一套组件）→ ``profile_resolver(symbol)``（**train**
+    路径）→ :func:`default_signal_spec`（全局默认三件套）。
+
+    snapshot 是 :func:`_spec_snapshot` 的产物（``kind``/``vote_threshold``/``components``
+    列表），正好是 :func:`parse_profile` 认得的 components 结构，故可无损还原。
+    """
+    if snapshot:
+        return parse_profile(dict(snapshot), source=str(snapshot.get("source") or "dataset"))
     if profile_resolver is None:
         return default_signal_spec()
     resolved = profile_resolver(symbol)
@@ -183,6 +199,93 @@ def _spec_snapshot(spec: ProfileSpec) -> Dict[str, Any]:
     }
 
 
+@dataclass(frozen=True)
+class MarketInputs:
+    """市场级特征输入（跨标的共享）。批量构建只读一次，单标的打分按需现读。
+
+    train(:func:`build_dataset`) 与 serve(:mod:`ml.scoring`) 共用本类——market 组的输入
+    来源只有一处定义，杜绝两边读到不同口径的指数/宽度。
+    """
+
+    index_rows: Optional[Sequence[Mapping[str, Any]]] = None
+    breadth_rows: Optional[Sequence[Mapping[str, Any]]] = None
+
+    @classmethod
+    def load(
+        cls,
+        groups: Sequence[str],
+        *,
+        index_code: str = DEFAULT_INDEX_CODE,
+        db_path: Optional[Path] = None,
+    ) -> "MarketInputs":
+        """``market`` 组启用时读指数日线 + 全市场宽度；否则返回空输入（特征列自动 NaN）。"""
+        if "market" not in groups:
+            return cls(None, None)
+        return cls(
+            index_rows=load_index_bars(index_code, db_path),
+            breadth_rows=load_market_daily(db_path),
+        )
+
+
+@dataclass(frozen=True)
+class SymbolFeatures:
+    """:func:`load_symbol_features` 的产物：原始日线行 + 特征帧 + 板块归属。"""
+
+    rows: Sequence[Mapping[str, Any]]
+    frame: pd.DataFrame
+    board_code: Optional[str] = None
+
+    @property
+    def empty(self) -> bool:
+        return not self.rows
+
+
+def load_symbol_features(
+    symbol: str,
+    *,
+    rows: Optional[Sequence[Mapping[str, Any]]] = None,
+    groups: Sequence[str] = FEATURE_GROUPS,
+    spec: Optional[ProfileSpec] = None,
+    market: Optional[MarketInputs] = None,
+    index_code: str = DEFAULT_INDEX_CODE,
+    db_path: Optional[Path] = None,
+) -> SymbolFeatures:
+    """读库 → 单标的特征帧。**train(:func:`build_dataset`) 与 serve(:mod:`ml.scoring`)
+    的唯一装配点**：两边调同一个函数、同一顺序读同一批表，故同 (symbol, trade_date) 的
+    特征逐列一致（D5 硬测试钉住），train/serve 偏斜在结构上不可能发生。
+
+    - ``rows`` 传 ``None`` 时自读 ``load_daily_bars(symbol)``；批量场景可先读出来做 A9
+      复权巡检再传入，避免重复读库。
+    - ``market`` 传 ``None`` 时按 ``groups`` 现读一次（单标的打分场景）；批量场景应
+      :meth:`MarketInputs.load` 预读后复用，避免每标的重复读指数/宽度。
+    - ``spec`` 传 ``None`` 时用全局默认三件套；serve 路径应传 manifest 里的画像快照
+      （见 :func:`resolve_spec`）以对齐训练口径。
+    - 无日线数据 → ``SymbolFeatures(rows=[], frame=空帧)``，不抛错（调用方优雅降级）。
+    """
+    if rows is None:
+        rows = load_daily_bars(symbol, db_path)
+    active_market = (
+        market if market is not None else MarketInputs.load(groups, index_code=index_code, db_path=db_path)
+    )
+    board_code: Optional[str] = None
+    board_rows: Optional[Sequence[Mapping[str, Any]]] = None
+    if "industry" in groups:
+        board_code = industry_board_for_symbol(symbol, db_path)
+        if board_code:
+            board_rows = load_industry_board_bars(board_code, db_path)
+
+    frame = symbol_feature_frame(
+        symbol,
+        rows,
+        groups=groups,
+        spec=spec,
+        index_rows=active_market.index_rows,
+        breadth_rows=active_market.breadth_rows,
+        board_rows=board_rows,
+    )
+    return SymbolFeatures(rows=rows, frame=frame, board_code=board_code)
+
+
 def _data_version(rows: Sequence[Mapping[str, Any]]) -> str:
     """取该标的日线序列的 data_version（A9 溯源戳，序列级元数据，取末行）。"""
     for row in reversed(rows):
@@ -203,31 +306,23 @@ def _content_hash(frame: pd.DataFrame, params: Mapping[str, Any]) -> str:
     return hashlib.sha256(key.encode("utf-8")).hexdigest()[:12]
 
 
-def _build_symbol_frame(
-    symbol: str,
+def _attach_labels(
+    frame: pd.DataFrame,
     rows: Sequence[Mapping[str, Any]],
     *,
-    groups: Sequence[str],
-    spec: ProfileSpec,
-    index_rows: Optional[Sequence[Mapping[str, Any]]],
-    breadth_rows: Optional[Sequence[Mapping[str, Any]]],
-    board_rows: Optional[Sequence[Mapping[str, Any]]],
     horizon: int,
     aux_horizon: int,
     costs: CostModel,
     start: Optional[str],
     end: Optional[str],
 ) -> pd.DataFrame:
-    """单标的：特征帧 + 标签列，按 [start,end] 与标签完整性过滤。"""
-    frame = symbol_feature_frame(
-        symbol,
-        rows,
-        groups=groups,
-        spec=spec,
-        index_rows=index_rows,
-        breadth_rows=breadth_rows,
-        board_rows=board_rows,
-    )
+    """给 :func:`load_symbol_features` 产出的特征帧附加标签列，并按 [start,end] 与标签
+    完整性过滤。
+
+    特征与标签在此**彻底分离**：特征只由 :func:`load_symbol_features` 装配（serve 路径共用），
+    标签是训练集专属（线上打分没有未来），故本函数只在 :func:`build_dataset` 内调用。
+    """
+    frame = frame.copy()
     bars = coerce_bars(rows)
     labels_main = label_series(bars, horizon=horizon, costs=costs)
     labels_aux = label_series(bars, horizon=aux_horizon, costs=costs)
@@ -313,9 +408,8 @@ def build_dataset(
     ml_dir = Path(out_dir) if out_dir is not None else DEFAULT_ML_DIR
     ml_dir.mkdir(parents=True, exist_ok=True)
 
-    # 市场级输入跨标的共享，只读一次（纯 DB、零网络）
-    index_rows = load_index_bars(index_code, db_path) if "market" in groups else None
-    breadth_rows = load_market_daily(db_path) if "market" in groups else None
+    # 市场级输入跨标的共享，只读一次（纯 DB、零网络）；与 serve 路径共用 MarketInputs.load
+    market = MarketInputs.load(groups, index_code=index_code, db_path=db_path)
 
     frames: List[pd.DataFrame] = []
     included: List[str] = []
@@ -342,22 +436,20 @@ def build_dataset(
             logger.warning("标的 %s 复权巡检不过，拒入数据集：%s", symbol, detail)
             continue
 
-        spec = _resolve_spec(symbol, profile_resolver)
-        board_code: Optional[str] = None
-        board_rows = None
-        if "industry" in groups:
-            board_code = industry_board_for_symbol(symbol, db_path)
-            if board_code:
-                board_rows = load_industry_board_bars(board_code, db_path)
-
-        frame = _build_symbol_frame(
+        spec = resolve_spec(symbol, profile_resolver)
+        # 特征装配走 train/serve 唯一入口（serve 侧 ml.scoring 调同一函数、同一顺序）
+        features = load_symbol_features(
             symbol,
-            rows,
+            rows=rows,
             groups=groups,
             spec=spec,
-            index_rows=index_rows,
-            breadth_rows=breadth_rows,
-            board_rows=board_rows,
+            market=market,
+            index_code=index_code,
+            db_path=db_path,
+        )
+        frame = _attach_labels(
+            features.frame,
+            rows,
             horizon=horizon,
             aux_horizon=aux_horizon,
             costs=cost_model,
@@ -370,10 +462,11 @@ def build_dataset(
 
         included.append(symbol)
         data_versions[symbol] = _data_version(rows)
-        # 画像 + 板块归属解析快照（provenance：训练用的 spec 与 industry 板块都可回溯）
+        # 画像 + 板块归属解析快照（provenance：训练用的 spec 与 industry 板块都可回溯，
+        # 且 serve 侧据此还原同一 spec —— 见 resolve_spec 的 snapshot 分支）
         profile_snapshot[symbol] = {
             "spec": _spec_snapshot(spec) if "signal" in groups else None,
-            "board_code": board_code,
+            "board_code": features.board_code,
         }
         frames.append(frame)
 
